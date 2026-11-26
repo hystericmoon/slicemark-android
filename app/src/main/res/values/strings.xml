@@ -1,0 +1,16 @@
+<resources>
+    <string name="app_name">Slicemark</string>
+    <string name="brand_studio">by Haho Studio</string>
+    <string name="home_headline">Precision on-device video slicing &amp; mastering.</string>
+    <string name="home_subtitle">Batch split, auto-tune color &amp; voice, burn overlays &amp; captions, and export directly to your device — zero uploads required.</string>
+    <string name="action_select_video">Select Video from Device</string>
+    <string name="action_try_sample">Try Built-in Sample Clip</string>
+    <string name="action_local_history">Local History</string>
+    <string name="action_replace_video">Replace Video</string>
+    <string name="action_export">Export</string>
+    <string name="action_apply_look">Apply Look</string>
+    <string name="action_clear_all">Clear All</string>
+    <string name="action_compare_original">Compare Original</string>
+    <string name="export_channel_name">Slicemark Exports</string>
+    <string name="export_channel_desc">Background progress and completion alerts for video and batch exports</string>
+</resources>

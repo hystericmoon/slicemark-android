@@ -1,0 +1,6 @@
+{
+  "name": "Slicemark",
+  "description": "Precision on-device Android video editor by Haho Studio with batch splitting, Smart Auto-Tune, overlays, captions, audio mixing, and multi-format export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
