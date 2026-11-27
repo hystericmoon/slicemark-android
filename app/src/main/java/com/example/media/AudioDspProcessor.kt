@@ -30,6 +30,147 @@ import kotlin.math.sqrt
 import kotlin.math.tanh
 
 /**
+ * Shared real-time PCM DSP kernel (gain 0..200%, loudness boost + soft limiter,
+ * Voice Clarity EQ highpass/lowpass/compressor, and fade envelope).
+ */
+class RealtimeAudioDspKernel {
+    private var sampleRate = 44100
+    private var channels = 2
+    private var hpPrevIn = FloatArray(8)
+    private var hpPrevOut = FloatArray(8)
+    private var lpPrevOut = FloatArray(8)
+    private var envFollower = 0f
+
+    fun configure(sampleRate: Int, channels: Int) {
+        this.sampleRate = sampleRate.coerceAtLeast(8000)
+        this.channels = channels.coerceIn(1, 8)
+        reset()
+    }
+
+    fun reset() {
+        hpPrevIn = FloatArray(channels)
+        hpPrevOut = FloatArray(channels)
+        lpPrevOut = FloatArray(channels)
+        envFollower = 0f
+    }
+
+    fun processBlock(
+        inShorts: java.nio.ShortBuffer,
+        outShorts: java.nio.ShortBuffer,
+        sampleCount: Int,
+        baseGain: Float,
+        loudnessNormalize: Boolean,
+        voiceClarityEq: Boolean,
+        frameFadeProvider: (frameOffset: Int) -> Float,
+    ) {
+        val hpRc = (1.0 / (2.0 * PI * 100.0)).toFloat()
+        val dt = 1f / sampleRate
+        val hpAlpha = hpRc / (hpRc + dt)
+        val lpRc = (1.0 / (2.0 * PI * 7500.0)).toFloat()
+        val lpAlpha = dt / (lpRc + dt)
+        val normBoost = if (loudnessNormalize) 1.32f else 1.0f
+
+        var i = 0
+        while (i < sampleCount) {
+            val fadeMul = frameFadeProvider(i / channels)
+            for (ch in 0 until channels) {
+                if (i + ch >= sampleCount) break
+                var x = inShorts.get(i + ch) / 32768f
+
+                if (voiceClarityEq) {
+                    val hp = hpAlpha * (hpPrevOut[ch] + x - hpPrevIn[ch])
+                    hpPrevIn[ch] = x
+                    hpPrevOut[ch] = hp
+                    val lp = lpPrevOut[ch] + lpAlpha * (hp - lpPrevOut[ch])
+                    lpPrevOut[ch] = lp
+                    val level = abs(lp)
+                    envFollower = if (level > envFollower) 0.92f * envFollower + 0.08f * level
+                    else 0.998f * envFollower + 0.002f * level
+                    val compGain = if (envFollower > 0.22f) (0.22f + (envFollower - 0.22f) * 0.45f) / envFollower else 1.18f
+                    x = lp * compGain
+                }
+
+                x = x * baseGain * normBoost * fadeMul
+                if (loudnessNormalize || baseGain > 1.05f) {
+                    x = tanh(x.toDouble()).toFloat()
+                }
+                val s = (x.coerceIn(-1f, 1f) * 32767f).roundToInt().toShort()
+                outShorts.put(s)
+            }
+            i += channels
+        }
+    }
+}
+
+data class LivePreviewAudioState(
+    val muted: Boolean = false,
+    val volumeGain: Float = 1.0f,
+    val loudnessNormalize: Boolean = false,
+    val voiceClarityEq: Boolean = false,
+    val fadeMultiplier: Float = 1.0f,
+    val bypassAll: Boolean = false,
+)
+
+/**
+ * Live ExoPlayer AudioProcessor reflecting Mute, 0..200% Gain, Loudness Normalize,
+ * Voice Clarity EQ, and Audio Fade-In/Out in real time during preview playback.
+ */
+@OptIn(UnstableApi::class)
+class LivePreviewAudioProcessor : BaseAudioProcessor() {
+    @Volatile
+    var liveState: LivePreviewAudioState = LivePreviewAudioState()
+
+    private val kernel = RealtimeAudioDspKernel()
+    private var channels = 2
+
+    override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
+        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT) {
+            return AudioProcessor.AudioFormat.NOT_SET
+        }
+        channels = inputAudioFormat.channelCount.coerceIn(1, 8)
+        kernel.configure(inputAudioFormat.sampleRate, channels)
+        return inputAudioFormat
+    }
+
+    override fun onFlush() {
+        kernel.reset()
+    }
+
+    override fun queueInput(inputBuffer: ByteBuffer) {
+        val remaining = inputBuffer.remaining()
+        if (remaining <= 0) return
+
+        val state = liveState
+        val outBuf = replaceOutputBuffer(remaining)
+        if (state.bypassAll) {
+            outBuf.put(inputBuffer)
+            outBuf.flip()
+            return
+        }
+
+        val inShorts = inputBuffer.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        val outShorts = outBuf.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        val sampleCount = inShorts.remaining()
+        val baseGain = if (state.muted) 0f else state.volumeGain.coerceIn(0f, 2f)
+        val fade = state.fadeMultiplier.coerceIn(0f, 1f)
+
+        kernel.processBlock(
+            inShorts = inShorts,
+            outShorts = outShorts,
+            sampleCount = sampleCount,
+            baseGain = baseGain,
+            loudnessNormalize = state.loudnessNormalize,
+            voiceClarityEq = state.voiceClarityEq,
+            frameFadeProvider = { fade },
+        )
+
+        inputBuffer.position(inputBuffer.limit())
+        outBuf.position(0)
+        outBuf.limit(remaining)
+    }
+}
+
+/**
  * Custom Media3 PCM AudioProcessor providing studio gain (0..200%), fade-in/out,
  * loudness normalization, and Voice Clarity EQ (highpass + lowpass + soft compressor).
  */
@@ -43,12 +184,7 @@ class StudioAudioProcessor(
     private var channels = 2
     private var processedFrames = 0L
     private var totalExpectedFrames = 1L
-
-    // Simple 1-pole HPF (100Hz) & LPF (7500Hz) state per channel
-    private var hpPrevIn = FloatArray(8)
-    private var hpPrevOut = FloatArray(8)
-    private var lpPrevOut = FloatArray(8)
-    private var envFollower = 0f
+    private val kernel = RealtimeAudioDspKernel()
 
     override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
         if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT) {
@@ -57,15 +193,13 @@ class StudioAudioProcessor(
         sampleRate = inputAudioFormat.sampleRate.coerceAtLeast(8000)
         channels = inputAudioFormat.channelCount.coerceIn(1, 8)
         totalExpectedFrames = max(1L, (clipDurationMs * sampleRate) / 1000L)
+        kernel.configure(sampleRate, channels)
         return inputAudioFormat
     }
 
     override fun onFlush() {
         processedFrames = 0L
-        hpPrevIn = FloatArray(channels)
-        hpPrevOut = FloatArray(channels)
-        lpPrevOut = FloatArray(channels)
-        envFollower = 0f
+        kernel.reset()
     }
 
     override fun queueInput(inputBuffer: ByteBuffer) {
@@ -77,62 +211,32 @@ class StudioAudioProcessor(
         val outShorts = outBuf.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
         val sampleCount = inShorts.remaining()
 
-        val hpRc = (1.0 / (2.0 * PI * 100.0)).toFloat()
-        val dt = 1f / sampleRate
-        val hpAlpha = hpRc / (hpRc + dt)
-
-        val lpRc = (1.0 / (2.0 * PI * 7500.0)).toFloat()
-        val lpAlpha = dt / (lpRc + dt)
-
         val fadeInFrames = (config.audioFadeInSec * sampleRate).toLong()
         val fadeOutFrames = (config.audioFadeOutSec * sampleRate).toLong()
         val baseGain = if (config.muted) 0f else config.volumeGain.coerceIn(0f, 2f)
-        val normBoost = if (config.loudnessNormalize) 1.32f else 1.0f
 
-        var i = 0
-        while (i < sampleCount) {
-            val frameIdx = processedFrames + (i / channels)
-            var fadeMul = 1f
-            if (fadeInFrames > 0 && frameIdx < fadeInFrames) {
-                fadeMul *= (frameIdx.toFloat() / fadeInFrames).coerceIn(0f, 1f)
-            }
-            if (fadeOutFrames > 0 && totalExpectedFrames > fadeOutFrames) {
-                val remFrames = totalExpectedFrames - frameIdx
-                if (remFrames < fadeOutFrames) {
-                    fadeMul *= (remFrames.toFloat() / fadeOutFrames).coerceIn(0f, 1f)
+        kernel.processBlock(
+            inShorts = inShorts,
+            outShorts = outShorts,
+            sampleCount = sampleCount,
+            baseGain = baseGain,
+            loudnessNormalize = config.loudnessNormalize,
+            voiceClarityEq = config.voiceClarityEq,
+            frameFadeProvider = { frameOffset ->
+                val frameIdx = processedFrames + frameOffset
+                var fadeMul = 1f
+                if (fadeInFrames > 0 && frameIdx < fadeInFrames) {
+                    fadeMul *= (frameIdx.toFloat() / fadeInFrames).coerceIn(0f, 1f)
                 }
-            }
-
-            for (ch in 0 until channels) {
-                if (i + ch >= sampleCount) break
-                var x = inShorts.get(i + ch) / 32768f
-
-                if (config.voiceClarityEq) {
-                    // Highpass @ 100Hz (removes rumble)
-                    val hp = hpAlpha * (hpPrevOut[ch] + x - hpPrevIn[ch])
-                    hpPrevIn[ch] = x
-                    hpPrevOut[ch] = hp
-                    // Lowpass @ 7.5kHz (tames harsh hiss)
-                    val lp = lpPrevOut[ch] + lpAlpha * (hp - lpPrevOut[ch])
-                    lpPrevOut[ch] = lp
-                    // Soft voice compressor
-                    val level = abs(lp)
-                    envFollower = if (level > envFollower) 0.92f * envFollower + 0.08f * level
-                    else 0.998f * envFollower + 0.002f * level
-                    val compGain = if (envFollower > 0.22f) (0.22f + (envFollower - 0.22f) * 0.45f) / envFollower else 1.18f
-                    x = lp * compGain
+                if (fadeOutFrames > 0 && totalExpectedFrames > fadeOutFrames) {
+                    val remFrames = totalExpectedFrames - frameIdx
+                    if (remFrames < fadeOutFrames) {
+                        fadeMul *= (remFrames.toFloat() / fadeOutFrames).coerceIn(0f, 1f)
+                    }
                 }
-
-                x = x * baseGain * normBoost * fadeMul
-                if (config.loudnessNormalize || baseGain > 1.05f) {
-                    // Soft-knee studio limiter
-                    x = tanh(x.toDouble()).toFloat()
-                }
-                val s = (x.coerceIn(-1f, 1f) * 32767f).roundToInt().toShort()
-                outShorts.put(s)
-            }
-            i += channels
-        }
+                fadeMul
+            },
+        )
 
         processedFrames += (sampleCount / channels)
         inputBuffer.position(inputBuffer.limit())
@@ -198,7 +302,7 @@ object AudioTrackExporter {
             offset += arr.size
         }
 
-        val bgPcm = config.bgTrackUri?.let { decodePcmSegment(context, it, 0L, 180_000L) }
+        val bgPcm = config.bgTrackUri?.let { decodePcmSegment(context, it, 0L, Long.MAX_VALUE) }
         val processed = applyOfflineDspAndMix(
             main = merged,
             channels = channels,
@@ -381,7 +485,7 @@ object AudioTrackExporter {
 
             extractor.selectTrack(trackIdx)
             val startUs = startMs * 1000L
-            val endUs = endMs * 1000L
+            val endUs = if (endMs == Long.MAX_VALUE) Long.MAX_VALUE else endMs * 1000L
             if (startUs > 0L) extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
 
             val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
@@ -403,7 +507,7 @@ object AudioTrackExporter {
                             val inBuf = codec.getInputBuffer(inIdx)!!
                             val size = extractor.readSampleData(inBuf, 0)
                             val pts = extractor.sampleTime
-                            if (size < 0 || pts > endUs + 250_000L) {
+                            if (size < 0 || (endUs != Long.MAX_VALUE && pts > endUs + 250_000L)) {
                                 codec.queueInputBuffer(inIdx, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                                 sawInEos = true
                             } else {
@@ -416,7 +520,9 @@ object AudioTrackExporter {
                     val outIdx = codec.dequeueOutputBuffer(info, 5_000)
                     if (outIdx >= 0) {
                         val outBuf = codec.getOutputBuffer(outIdx)
-                        if (outBuf != null && info.size > 0 && info.presentationTimeUs in startUs..endUs) {
+                        val inRange = info.presentationTimeUs >= startUs &&
+                            (endUs == Long.MAX_VALUE || info.presentationTimeUs <= endUs)
+                        if (outBuf != null && info.size > 0 && inRange) {
                             outBuf.position(info.offset)
                             outBuf.limit(info.offset + info.size)
                             val chunk = ByteArray(info.size)
@@ -470,7 +576,7 @@ object AudioTrackExporter {
         val fadeInFrames = (config.audioFadeInSec * sampleRate).toInt()
         val fadeOutFrames = (config.audioFadeOutSec * sampleRate).toInt()
         val mainGain = if (config.muted) 0f else config.volumeGain.coerceIn(0f, 2f)
-        val bgGain = config.bgTrackVolume.coerceIn(0f, 1f)
+        val bgGain = config.bgTrackVolume.coerceIn(0f, 1.5f)
 
         // Loudness normalization gain estimate
         var sumSq = 0.0

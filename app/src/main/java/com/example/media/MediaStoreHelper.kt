@@ -280,9 +280,30 @@ object MediaStoreHelper {
     }
 
     fun buildColorMatrix(visual: VisualConfig): ColorMatrix {
-        val sat = ColorMatrix().apply { setSaturation(visual.saturation.coerceIn(0f, 2f)) }
-        val c = visual.contrast.coerceIn(0.4f, 1.8f)
-        val b = (visual.brightness.coerceIn(-0.5f, 0.5f) * 255f)
+        return buildColorMatrixInternal(
+            brightness = visual.brightness,
+            contrast = visual.contrast,
+            saturation = visual.saturation,
+        )
+    }
+
+    fun buildPreviewColorMatrix(visual: VisualConfig): ColorMatrix {
+        val effectiveContrast = visual.contrast * (1f + visual.sharpen.coerceIn(0f, 1f) * 0.08f)
+        return buildColorMatrixInternal(
+            brightness = visual.brightness,
+            contrast = effectiveContrast,
+            saturation = visual.saturation,
+        )
+    }
+
+    private fun buildColorMatrixInternal(
+        brightness: Float,
+        contrast: Float,
+        saturation: Float,
+    ): ColorMatrix {
+        val sat = ColorMatrix().apply { setSaturation(saturation.coerceIn(0f, 2f)) }
+        val c = contrast.coerceIn(0.4f, 1.8f)
+        val b = (brightness.coerceIn(-0.5f, 0.5f) * 255f)
         val t = (1f - c) * 128f + b
         val cb = ColorMatrix(
             floatArrayOf(

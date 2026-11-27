@@ -19,13 +19,17 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.ContentCut
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.MovieFilter
 import androidx.compose.material.icons.filled.Topic
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -42,7 +46,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import com.example.autotune.ModelPresetOption
 import com.example.autotune.SmartAutoTuneEngine
 import com.example.model.AutoTuneEngineType
 import com.example.model.AutoTuneGoal
@@ -133,11 +139,12 @@ fun TrimToolPanel(
                         }
 
                         SplitMethod.N_PARTS -> {
+                            var customParts by remember(trim.targetPartCount) { mutableStateOf(trim.targetPartCount.toString()) }
                             FlowRow(
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 verticalArrangement = Arrangement.spacedBy(6.dp),
                             ) {
-                                listOf(2, 3, 4, 6, 8, 10, 12).forEach { n ->
+                                listOf(2, 3, 4, 5, 6, 8, 10, 12).forEach { n ->
                                     StudioChoiceChip(
                                         text = "$n Parts",
                                         selected = trim.targetPartCount == n,
@@ -145,22 +152,68 @@ fun TrimToolPanel(
                                     )
                                 }
                             }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                OutlinedTextField(
+                                    value = customParts,
+                                    onValueChange = { customParts = it.filter(Char::isDigit).take(2) },
+                                    label = { Text("Custom parts (2–50)") },
+                                    singleLine = true,
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Button(
+                                    onClick = {
+                                        val v = customParts.toIntOrNull()?.coerceIn(2, 50) ?: 4
+                                        viewModel.updateTrimConfig(recalculateClips = true) { it.copy(targetPartCount = v) }
+                                    },
+                                    shape = RoundedCornerShape(8.dp),
+                                ) { Text("Split") }
+                            }
                         }
 
                         SplitMethod.MAX_MB -> {
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                StudioChoiceChip(
-                                    text = "10 MB (Discord)",
-                                    selected = trim.maxFileSizeMb == 10,
-                                    onClick = { viewModel.updateTrimConfig(recalculateClips = true) { it.copy(maxFileSizeMb = 10) } },
+                            var customMb by remember(trim.maxFileSizeMb) { mutableStateOf(trim.maxFileSizeMb.toString()) }
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                listOf(
+                                    10 to "10 MB (Discord)",
+                                    16 to "16 MB (WhatsApp)",
+                                    25 to "25 MB",
+                                    50 to "50 MB",
+                                ).forEach { (mb, label) ->
+                                    StudioChoiceChip(
+                                        text = label,
+                                        selected = trim.maxFileSizeMb == mb,
+                                        onClick = { viewModel.updateTrimConfig(recalculateClips = true) { it.copy(maxFileSizeMb = mb) } },
+                                    )
+                                }
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                OutlinedTextField(
+                                    value = customMb,
+                                    onValueChange = { customMb = it.filter(Char::isDigit).take(3) },
+                                    label = { Text("Custom max MB (1–500)") },
+                                    singleLine = true,
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                                     modifier = Modifier.weight(1f),
                                 )
-                                StudioChoiceChip(
-                                    text = "16 MB (WhatsApp)",
-                                    selected = trim.maxFileSizeMb == 16,
-                                    onClick = { viewModel.updateTrimConfig(recalculateClips = true) { it.copy(maxFileSizeMb = 16) } },
-                                    modifier = Modifier.weight(1f),
-                                )
+                                Button(
+                                    onClick = {
+                                        val v = customMb.toIntOrNull()?.coerceIn(1, 500) ?: 10
+                                        viewModel.updateTrimConfig(recalculateClips = true) { it.copy(maxFileSizeMb = v) }
+                                    },
+                                    shape = RoundedCornerShape(8.dp),
+                                ) { Text("Apply") }
                             }
                         }
                     }
@@ -419,25 +472,31 @@ fun TuneToolPanel(
 
             if (at.selectedEngine == AutoTuneEngineType.OPENROUTER_BYOK) {
                 ByokEngineConfigSection(
-                    title = "OpenRouter BYOK (Stored encrypted on-device)",
+                    engineKey = "openrouter",
+                    title = "OpenRouter API Key",
+                    placeholder = "sk-or-v1-...",
                     hasSavedKey = at.hasOpenRouterKey,
-                    presets = SmartAutoTuneEngine.openRouterPresets,
+                    presets = SmartAutoTuneEngine.openRouterPresetOptions,
                     selectedPreset = at.openRouterModelPreset,
                     customModel = at.openRouterCustomModel,
                     onSelectPreset = { viewModel.setOpenRouterModelPreset(it) },
                     onCustomModelChange = { viewModel.setOpenRouterCustomModel(it) },
                     onSaveKey = { viewModel.saveByokKey(AutoTuneEngineType.OPENROUTER_BYOK, it) },
+                    onRevealSavedKey = { viewModel.getSavedByokKey(AutoTuneEngineType.OPENROUTER_BYOK) },
                 )
             } else if (at.selectedEngine == AutoTuneEngineType.GEMINI_BYOK) {
                 ByokEngineConfigSection(
-                    title = "Gemini BYOK (Stored encrypted on-device)",
+                    engineKey = "gemini",
+                    title = "Gemini API Key",
+                    placeholder = "AIza...",
                     hasSavedKey = at.hasGeminiKey,
-                    presets = SmartAutoTuneEngine.geminiPresets,
+                    presets = SmartAutoTuneEngine.geminiPresetOptions,
                     selectedPreset = at.geminiModelPreset,
                     customModel = at.geminiCustomModel,
                     onSelectPreset = { viewModel.setGeminiModelPreset(it) },
                     onCustomModelChange = { viewModel.setGeminiCustomModel(it) },
                     onSaveKey = { viewModel.saveByokKey(AutoTuneEngineType.GEMINI_BYOK, it) },
+                    onRevealSavedKey = { viewModel.getSavedByokKey(AutoTuneEngineType.GEMINI_BYOK) },
                 )
             }
 
@@ -629,17 +688,21 @@ fun TuneToolPanel(
 
 @Composable
 private fun ByokEngineConfigSection(
+    engineKey: String,
     title: String,
+    placeholder: String,
     hasSavedKey: Boolean,
-    presets: List<String>,
+    presets: List<ModelPresetOption>,
     selectedPreset: String,
     customModel: String,
     onSelectPreset: (String) -> Unit,
     onCustomModelChange: (String) -> Unit,
     onSaveKey: (String) -> Unit,
+    onRevealSavedKey: () -> String,
 ) {
     val studio = LocalStudioColors.current
-    var keyDraft by remember { mutableStateOf("") }
+    var keyDraft by remember(engineKey) { mutableStateOf("") }
+    var showKey by remember(engineKey) { mutableStateOf(false) }
 
     Surface(
         shape = RoundedCornerShape(8.dp),
@@ -657,7 +720,7 @@ private fun ByokEngineConfigSection(
             ) {
                 Text(title, style = MaterialTheme.typography.labelMedium)
                 if (hasSavedKey) {
-                    StudioBadgePill(text = "Key Saved", accent = true)
+                    StudioBadgePill(text = "Saved ✓", accent = true)
                 }
             }
 
@@ -670,7 +733,25 @@ private fun ByokEngineConfigSection(
                     value = keyDraft,
                     onValueChange = { keyDraft = it },
                     label = { Text(if (hasSavedKey) "Update API key" else "Paste API key") },
-                    visualTransformation = PasswordVisualTransformation(),
+                    placeholder = { Text(placeholder) },
+                    visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(
+                            onClick = {
+                                val nextShow = !showKey
+                                showKey = nextShow
+                                if (nextShow && keyDraft.isEmpty() && hasSavedKey) {
+                                    keyDraft = onRevealSavedKey()
+                                }
+                            },
+                        ) {
+                            Icon(
+                                imageVector = if (showKey) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                contentDescription = if (showKey) "Hide API key" else "Show API key",
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    },
                     singleLine = true,
                     modifier = Modifier.weight(1f),
                 )
@@ -678,9 +759,27 @@ private fun ByokEngineConfigSection(
                     onClick = {
                         onSaveKey(keyDraft)
                         keyDraft = ""
+                        showKey = false
                     },
                     shape = RoundedCornerShape(8.dp),
                 ) { Text("Save") }
+                if (hasSavedKey) {
+                    IconButton(
+                        onClick = {
+                            onSaveKey("")
+                            keyDraft = ""
+                            showKey = false
+                        },
+                        modifier = Modifier.size(36.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.DeleteOutline,
+                            contentDescription = "Clear saved API key",
+                            tint = studio.danger,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
             }
 
             Text("Model Preset", style = MaterialTheme.typography.labelSmall, color = studio.mutedInk)
@@ -690,11 +789,11 @@ private fun ByokEngineConfigSection(
             ) {
                 presets.forEach { preset ->
                     StudioChoiceChip(
-                        text = preset.substringAfter('/'),
-                        selected = selectedPreset == preset && customModel.isBlank(),
+                        text = preset.shortLabel,
+                        selected = selectedPreset == preset.id && customModel.isBlank(),
                         onClick = {
                             onCustomModelChange("")
-                            onSelectPreset(preset)
+                            onSelectPreset(preset.id)
                         },
                     )
                 }
@@ -704,8 +803,17 @@ private fun ByokEngineConfigSection(
                 value = customModel,
                 onValueChange = onCustomModelChange,
                 label = { Text("Or custom model ID") },
+                placeholder = {
+                    Text(if (engineKey == "openrouter") "e.g. google/gemini-2.5-flash" else "e.g. gemini-2.5-flash")
+                },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
+            )
+
+            Text(
+                text = "Tries best model first, auto-falls back if busy. Stored encrypted on-device.",
+                style = MaterialTheme.typography.labelSmall,
+                color = studio.mutedInk,
             )
         }
     }

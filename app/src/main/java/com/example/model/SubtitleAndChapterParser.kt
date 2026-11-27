@@ -1,5 +1,9 @@
 package com.example.model
 
+import org.json.JSONArray
+import org.json.JSONObject
+import kotlin.math.roundToLong
+
 object SubtitleAndChapterParser {
 
     private val timeRegex = Regex("""(\d{1,2}):(\d{2})(?::(\d{2}))?[.,](\d{1,3})""")
@@ -124,5 +128,27 @@ object SubtitleAndChapterParser {
                 ?: clip.label.ifBlank { "Part ${idx + 1}" }
             "${formatTimecode(clip.startMs, includeCentiseconds = false)} $title"
         }.joinToString("\n")
+    }
+
+    fun exportChaptersJson(clips: List<ClipSegment>): String {
+        val arr = JSONArray()
+        clips.forEachIndexed { idx, clip ->
+            val startSec = (clip.startMs / 10.0).roundToLong() / 100.0
+            val endSec = (clip.endMs / 10.0).roundToLong() / 100.0
+            val durSec = ((clip.endMs - clip.startMs).coerceAtLeast(0L) / 10.0).roundToLong() / 100.0
+            val label = clip.chapterTitle?.takeIf { it.isNotBlank() }
+                ?: clip.label.ifBlank { "Part ${idx + 1}" }
+            arr.put(
+                JSONObject().apply {
+                    put("index", idx + 1)
+                    put("label", label)
+                    put("startTime", startSec)
+                    put("endTime", endSec)
+                    put("duration", durSec)
+                    put("selected", clip.isSelected)
+                }
+            )
+        }
+        return arr.toString(2)
     }
 }

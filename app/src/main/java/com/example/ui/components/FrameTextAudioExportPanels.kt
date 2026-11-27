@@ -1,5 +1,6 @@
 package com.example.ui.components
 
+import android.graphics.Color as AndroidColor
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -19,17 +20,24 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.RotateRight
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Flip
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.Subtitles
@@ -44,11 +52,16 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.model.AspectPreset
@@ -58,7 +71,11 @@ import com.example.model.ExportQualityPreset
 import com.example.model.ExportResolution
 import com.example.model.ExportTargetMode
 import com.example.model.FitMode
+import com.example.model.ManualMode
 import com.example.model.OverlayCorner
+import com.example.model.PlatformPreset
+import com.example.model.SplitMethod
+import com.example.model.TrimWorkflow
 import com.example.model.formatCompactDuration
 import com.example.model.formatTimecode
 import com.example.ui.theme.LocalStudioColors
@@ -102,10 +119,15 @@ fun FrameToolPanel(
             )
 
             if (visual.fitMode == FitMode.SOLID_MATTE) {
-                StudioSectionHeader("Matte Swatch")
-                Row(
+                var showCustomPicker by remember { mutableStateOf(visual.matteColorArgb !in MatteSwatches) }
+                StudioSectionHeader(
+                    title = "Matte Swatch",
+                    trailing = String.format("#%06X", visual.matteColorArgb and 0xFFFFFF),
+                )
+                FlowRow(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     MatteSwatches.forEach { argb ->
                         val selected = visual.matteColorArgb == argb
@@ -123,6 +145,101 @@ fun FrameToolPanel(
                                     viewModel.updateVisual(recordUndo = true) { it.copy(matteColorArgb = argb) }
                                 },
                         )
+                    }
+                    Surface(
+                        onClick = { showCustomPicker = !showCustomPicker },
+                        shape = CircleShape,
+                        color = Color(visual.matteColorArgb),
+                        border = BorderStroke(
+                            width = if (showCustomPicker) 2.5.dp else 1.dp,
+                            color = if (showCustomPicker) studio.timelineAccent else studio.hairline,
+                        ),
+                        modifier = Modifier.size(30.dp),
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Filled.Palette,
+                                contentDescription = "Custom matte color",
+                                tint = if (AndroidColor.luminance(visual.matteColorArgb) > 0.55f) Color.Black else Color.White,
+                                modifier = Modifier.size(16.dp),
+                            )
+                        }
+                    }
+                }
+                if (showCustomPicker) {
+                    val hsv = remember(visual.matteColorArgb) {
+                        FloatArray(3).also { AndroidColor.colorToHSV(visual.matteColorArgb, it) }
+                    }
+                    var hexInput by remember(visual.matteColorArgb) {
+                        mutableStateOf(String.format("#%06X", visual.matteColorArgb and 0xFFFFFF))
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = studio.surfaceWell,
+                        border = BorderStroke(1.dp, studio.hairline),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                OutlinedTextField(
+                                    value = hexInput,
+                                    onValueChange = { raw ->
+                                        hexInput = raw.take(7)
+                                    },
+                                    label = { Text("Hex (#RRGGBB)") },
+                                    singleLine = true,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Button(
+                                    onClick = {
+                                        val clean = hexInput.trim().let { if (it.startsWith("#")) it else "#$it" }
+                                        val parsed = runCatching { AndroidColor.parseColor(clean) }.getOrNull()
+                                        if (parsed != null) {
+                                            viewModel.updateVisual(recordUndo = true) { it.copy(matteColorArgb = parsed) }
+                                        } else {
+                                            viewModel.showToast("Enter a valid hex color like #1E293B")
+                                        }
+                                    },
+                                    shape = RoundedCornerShape(8.dp),
+                                ) { Text("Set") }
+                            }
+                            StudioLabeledSlider(
+                                label = "Hue",
+                                valueText = "${hsv[0].roundToInt()}°",
+                                value = hsv[0],
+                                valueRange = 0f..360f,
+                                onValueChange = { h ->
+                                    val c = AndroidColor.HSVToColor(floatArrayOf(h, hsv[1].coerceAtLeast(0.15f), hsv[2].coerceAtLeast(0.15f)))
+                                    viewModel.updateVisual { it.copy(matteColorArgb = c) }
+                                },
+                            )
+                            StudioLabeledSlider(
+                                label = "Saturation",
+                                valueText = "${(hsv[1] * 100).roundToInt()}%",
+                                value = hsv[1],
+                                valueRange = 0f..1f,
+                                onValueChange = { s ->
+                                    val c = AndroidColor.HSVToColor(floatArrayOf(hsv[0], s, hsv[2]))
+                                    viewModel.updateVisual { it.copy(matteColorArgb = c) }
+                                },
+                            )
+                            StudioLabeledSlider(
+                                label = "Brightness",
+                                valueText = "${(hsv[2] * 100).roundToInt()}%",
+                                value = hsv[2],
+                                valueRange = 0f..1f,
+                                onValueChange = { v ->
+                                    val c = AndroidColor.HSVToColor(floatArrayOf(hsv[0], hsv[1], v))
+                                    viewModel.updateVisual { it.copy(matteColorArgb = c) }
+                                },
+                            )
+                        }
                     }
                 }
             }
@@ -294,8 +411,14 @@ fun TextAndCaptionsToolPanel(
             }
             if (overlay.subtitles.isNotEmpty()) {
                 StudioToggleRow(
+                    title = "Auto-Slice .SRT Files",
+                    subtitle = "Export re-timed .srt per clip (standalone or inside ZIP)",
+                    checked = overlay.includeSlicedSrt,
+                    onCheckedChange = { c -> viewModel.updateOverlay(true) { it.copy(includeSlicedSrt = c) } },
+                )
+                StudioToggleRow(
                     title = "Burn-In Captions into Video",
-                    subtitle = "Also auto-slices re-timed .SRT files inside ZIP exports",
+                    subtitle = "Hard-render styled captions directly onto exported frames",
                     checked = overlay.burnInCaptions,
                     onCheckedChange = { c -> viewModel.updateOverlay(true) { it.copy(burnInCaptions = c) } },
                 )
@@ -333,14 +456,14 @@ fun AudioAndMotionToolPanel(
                 label = "Audio Fade-In",
                 valueText = String.format("%.1fs", audio.audioFadeInSec),
                 value = audio.audioFadeInSec,
-                valueRange = 0f..3f,
+                valueRange = 0f..5f,
                 onValueChange = { v -> viewModel.updateAudioMotion { it.copy(audioFadeInSec = v) } },
             )
             StudioLabeledSlider(
                 label = "Audio Fade-Out",
                 valueText = String.format("%.1fs", audio.audioFadeOutSec),
                 value = audio.audioFadeOutSec,
-                valueRange = 0f..3f,
+                valueRange = 0f..5f,
                 onValueChange = { v -> viewModel.updateAudioMotion { it.copy(audioFadeOutSec = v) } },
             )
             StudioToggleRow(
@@ -381,7 +504,7 @@ fun AudioAndMotionToolPanel(
                     label = "BG Track Mix Volume",
                     valueText = "${(audio.bgTrackVolume * 100).roundToInt()}%",
                     value = audio.bgTrackVolume,
-                    valueRange = 0f..1f,
+                    valueRange = 0f..1.5f,
                     onValueChange = { v -> viewModel.updateAudioMotion { it.copy(bgTrackVolume = v) } },
                 )
             }
@@ -439,6 +562,58 @@ fun ExportToolPanel(
     val selectedCount = state.selectedClips.size
 
     Column(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        StudioCard {
+            StudioSectionHeader("Platform Quick Presets")
+            val activePreset = detectMatchingPlatformPreset(state)
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                PlatformPreset.entries.chunked(2).forEach { rowItems ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        rowItems.forEach { preset ->
+                            val selected = activePreset == preset
+                            Surface(
+                                onClick = { viewModel.applyPlatformPreset(preset) },
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (selected) studio.timelineAccentDim else studio.surfaceWell,
+                                border = BorderStroke(
+                                    width = if (selected) 1.5.dp else 1.dp,
+                                    color = if (selected) studio.timelineAccent else studio.hairline,
+                                ),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("platform_preset_${preset.id}"),
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                                ) {
+                                    Text(
+                                        text = preset.title,
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = if (selected) studio.timelineAccent else MaterialTheme.colorScheme.onSurface,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    Text(
+                                        text = preset.subtitle,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = studio.mutedInk,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                        }
+                        if (rowItems.size == 1) {
+                            Spacer(Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
+        }
+
         StudioCard {
             StudioSectionHeader("Export Target")
             StudioSegmentedRow(
@@ -505,7 +680,7 @@ fun ExportToolPanel(
 
             StudioToggleRow(
                 title = "Bundle Batch as ZIP",
-                subtitle = "Saves clips directly to Movies/Slicemark when OFF (includes sliced .SRTs when ON)",
+                subtitle = "Saves clips & sliced .SRTs directly to device when OFF",
                 checked = exp.bundleAsZip,
                 onCheckedChange = { b -> viewModel.updateExportConfig { it.copy(bundleAsZip = b) } },
             )
@@ -557,6 +732,10 @@ fun ClipQueuePanel(
 ) {
     val studio = LocalStudioColors.current
     val selectedCount = state.selectedClips.size
+    val isRemoveMiddle = state.trimConfig.workflow == TrimWorkflow.MANUAL &&
+        state.trimConfig.manualMode == ManualMode.REMOVE_MIDDLE
+    var editingClipId by remember { mutableStateOf<String?>(null) }
+    var labelDraft by remember { mutableStateOf("") }
 
     Column(modifier = modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(
@@ -564,23 +743,42 @@ fun ClipQueuePanel(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Column {
-                Text("Clip Queue", style = MaterialTheme.typography.titleSmall)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(if (isRemoveMiddle) "Cut-Out Region" else "Clip Queue", style = MaterialTheme.typography.titleSmall)
                 Text(
                     text = "$selectedCount/${state.clips.size} selected • ${formatCompactDuration(state.selectedTotalDurationMs)}",
                     style = StudioMonoSmall,
                     color = studio.mutedInk,
                 )
             }
-            TextButton(
-                onClick = { viewModel.selectAllClips(selectedCount < state.clips.size) },
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                Text(if (selectedCount < state.clips.size) "All" else "None")
+                if (!isRemoveMiddle && state.clips.size > 1) {
+                    TextButton(
+                        onClick = { viewModel.selectAllClips(selectedCount < state.clips.size) },
+                    ) {
+                        Text(if (selectedCount < state.clips.size) "All" else "None")
+                    }
+                }
+                if (!isRemoveMiddle) {
+                    OutlinedButton(
+                        onClick = { viewModel.addManualClipAtPlayhead() },
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.height(34.dp).testTag("add_manual_clip_button"),
+                    ) {
+                        Icon(Icons.Filled.Add, null, modifier = Modifier.size(15.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Add Clip", style = MaterialTheme.typography.labelMedium)
+                    }
+                }
             }
         }
 
         state.clips.forEachIndexed { idx, clip ->
             val isActive = clip.id == state.activeClip?.id
+            val isEditing = editingClipId == clip.id
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -624,12 +822,69 @@ fun ClipQueuePanel(
                         }
 
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = clip.label.ifBlank { "Clip ${idx + 1}" },
-                                style = MaterialTheme.typography.labelLarge,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
+                            if (isEditing) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    OutlinedTextField(
+                                        value = labelDraft,
+                                        onValueChange = { labelDraft = it },
+                                        singleLine = true,
+                                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                                        keyboardActions = KeyboardActions(
+                                            onDone = {
+                                                viewModel.renameClip(clip.id, labelDraft)
+                                                editingClipId = null
+                                            }
+                                        ),
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    IconButton(
+                                        onClick = {
+                                            viewModel.renameClip(clip.id, labelDraft)
+                                            editingClipId = null
+                                        },
+                                        modifier = Modifier.size(32.dp),
+                                    ) {
+                                        Icon(Icons.Filled.Check, "Save label", tint = studio.success, modifier = Modifier.size(18.dp))
+                                    }
+                                    IconButton(
+                                        onClick = { editingClipId = null },
+                                        modifier = Modifier.size(32.dp),
+                                    ) {
+                                        Icon(Icons.Filled.Close, "Cancel rename", tint = studio.mutedInk, modifier = Modifier.size(16.dp))
+                                    }
+                                }
+                            } else {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                ) {
+                                    Text(
+                                        text = clip.label.ifBlank { "Clip ${idx + 1}" },
+                                        style = MaterialTheme.typography.labelLarge,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false),
+                                    )
+                                    IconButton(
+                                        onClick = {
+                                            editingClipId = clip.id
+                                            labelDraft = clip.label.ifBlank { "Clip ${idx + 1}" }
+                                        },
+                                        modifier = Modifier.size(26.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Edit,
+                                            contentDescription = "Rename clip",
+                                            tint = studio.mutedInk,
+                                            modifier = Modifier.size(14.dp),
+                                        )
+                                    }
+                                }
+                            }
                             Text(
                                 text = "${formatTimecode(clip.startMs, false)} – ${formatTimecode(clip.endMs, false)} • ${formatCompactDuration(clip.durationMs)}",
                                 style = StudioMonoSmall,
@@ -670,5 +925,38 @@ fun ClipQueuePanel(
                 }
             }
         }
+    }
+}
+
+private fun detectMatchingPlatformPreset(state: EditorUiState): PlatformPreset? {
+    val t = state.trimConfig
+    val e = state.exportConfig
+    val v = state.visualConfig
+    if (t.workflow != TrimWorkflow.BATCH_SPLIT || e.format != ExportFormat.MP4) return null
+    return when {
+        v.aspectPreset == AspectPreset.PORTRAIT_9_16 &&
+            e.resolution == ExportResolution.P1080 &&
+            e.qualityPreset == ExportQualityPreset.BALANCED &&
+            t.splitMethod == SplitMethod.INTERVAL &&
+            t.intervalSec == 15 -> PlatformPreset.REELS
+        v.aspectPreset == AspectPreset.PORTRAIT_9_16 &&
+            e.resolution == ExportResolution.P1080 &&
+            e.qualityPreset == ExportQualityPreset.BALANCED &&
+            t.splitMethod == SplitMethod.INTERVAL &&
+            t.intervalSec == 60 -> PlatformPreset.TIKTOK
+        e.resolution == ExportResolution.P720 &&
+            e.qualityPreset == ExportQualityPreset.COMPACT &&
+            t.splitMethod == SplitMethod.MAX_MB &&
+            t.maxFileSizeMb == 16 -> PlatformPreset.WHATSAPP
+        e.resolution == ExportResolution.P480 &&
+            e.qualityPreset == ExportQualityPreset.COMPACT &&
+            t.splitMethod == SplitMethod.MAX_MB &&
+            t.maxFileSizeMb == 10 -> PlatformPreset.DISCORD
+        v.aspectPreset == AspectPreset.SQUARE_1_1 &&
+            e.resolution == ExportResolution.P1080 &&
+            e.qualityPreset == ExportQualityPreset.BALANCED &&
+            t.splitMethod == SplitMethod.INTERVAL &&
+            t.intervalSec == 30 -> PlatformPreset.SQUARE
+        else -> null
     }
 }

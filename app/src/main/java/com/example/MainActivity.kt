@@ -35,7 +35,6 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.model.ClipSegment
-import com.example.model.SubtitleAndChapterParser
 import com.example.ui.components.ChaptersTimestampDialog
 import com.example.ui.components.LocalHistorySheet
 import com.example.ui.screens.EditorWorkspaceScreen
@@ -228,8 +227,10 @@ class MainActivity : ComponentActivity() {
 
                     if (showChaptersModal) {
                         ChaptersTimestampDialog(
-                            initialText = SubtitleAndChapterParser.exportChaptersText(state.clips),
+                            clips = state.clips,
+                            totalDurationMs = state.sourceMedia?.durationMs ?: 0L,
                             onApplyChapters = { raw -> vm.applyChaptersText(raw) },
+                            onExportJson = { vm.exportChaptersJsonToDevice() },
                             onDismiss = { showChaptersModal = false },
                         )
                     }

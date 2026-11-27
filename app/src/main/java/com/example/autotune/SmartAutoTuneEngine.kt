@@ -15,26 +15,37 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 
 class InvalidApiKeyException(message: String) : Exception(message)
 
+data class ModelPresetOption(
+    val id: String,
+    val label: String,
+    val shortLabel: String,
+)
+
 object SmartAutoTuneEngine {
 
-    val openRouterPresets = listOf(
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "google/gemma-3-27b-it:free",
-        "qwen/qwen-2.5-72b-instruct:free",
-        "openai/gpt-4o-mini",
-        "anthropic/claude-3.5-sonnet",
+    val openRouterPresetOptions = listOf(
+        ModelPresetOption("auto", "Auto (Best Free -> Fallback)", "Auto (Best -> Fallback)"),
+        ModelPresetOption("openrouter/free", "OpenRouter Free Auto · Free", "OpenRouter Free"),
+        ModelPresetOption("google/gemini-2.5-flash", "Gemini 2.5 Flash · Fast", "Gemini 2.5 Flash"),
+        ModelPresetOption("anthropic/claude-sonnet-4", "Claude Sonnet 4 · Best quality", "Claude Sonnet 4"),
+        ModelPresetOption("openai/gpt-4o-mini", "GPT-4o mini · Balanced", "GPT-4o mini"),
     )
 
-    val geminiPresets = listOf(
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.0-flash",
+    val geminiPresetOptions = listOf(
+        ModelPresetOption("auto", "Auto (Best -> Fast fallback)", "Auto (Best -> Fallback)"),
+        ModelPresetOption("gemini-2.5-pro", "Gemini 2.5 Pro · Best quality", "Gemini 2.5 Pro"),
+        ModelPresetOption("gemini-2.5-flash", "Gemini 2.5 Flash · Free & fast", "Gemini 2.5 Flash"),
+        ModelPresetOption("gemini-2.5-flash-lite", "Gemini 2.5 Flash-Lite · Fastest", "Gemini 2.5 Flash-Lite"),
     )
+
+    val openRouterPresets = openRouterPresetOptions.map { it.id }
+    val geminiPresets = geminiPresetOptions.map { it.id }
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -68,7 +79,7 @@ object SmartAutoTuneEngine {
         return@withContext when (engine) {
             AutoTuneEngineType.OPENROUTER_BYOK -> runOpenRouterWithFallback(
                 apiKey = apiKey,
-                primaryModel = selectedModel.ifBlank { openRouterPresets.first() },
+                primaryModel = selectedModel.ifBlank { "auto" },
                 goal = goal,
                 customDirection = customDirection,
                 telemetry = telemetry,
@@ -77,7 +88,7 @@ object SmartAutoTuneEngine {
             )
             AutoTuneEngineType.GEMINI_BYOK -> runGeminiWithFallback(
                 apiKey = apiKey,
-                primaryModel = selectedModel.ifBlank { geminiPresets.first() },
+                primaryModel = selectedModel.ifBlank { "auto" },
                 goal = goal,
                 customDirection = customDirection,
                 telemetry = telemetry,
@@ -226,6 +237,32 @@ object SmartAutoTuneEngine {
         )
     }
 
+    fun getOpenRouterFallbackChain(selectedModel: String): List<String> {
+        val trimmed = selectedModel.trim()
+        if (trimmed.isEmpty() || trimmed.equals("auto", ignoreCase = true)) {
+            return listOf(
+                "openrouter/free",
+                "google/gemma-3-27b-it:free",
+                "qwen/qwen2.5-vl-72b-instruct:free",
+            )
+        }
+        val clean = sanitizeModelId(trimmed) ?: return emptyList()
+        return listOf(clean, "openrouter/free").distinct()
+    }
+
+    fun getGeminiFallbackChain(selectedModel: String): List<String> {
+        val trimmed = selectedModel.trim()
+        if (trimmed.isEmpty() || trimmed.equals("auto", ignoreCase = true)) {
+            return listOf(
+                "gemini-2.5-pro",
+                "gemini-2.5-flash",
+                "gemini-2.5-flash-lite",
+            )
+        }
+        val clean = sanitizeModelId(trimmed.removePrefix("models/")) ?: return emptyList()
+        return listOf(clean, "gemini-2.5-flash", "gemini-2.5-flash-lite").distinct()
+    }
+
     private fun runOpenRouterWithFallback(
         apiKey: String,
         primaryModel: String,
@@ -235,14 +272,16 @@ object SmartAutoTuneEngine {
         source: SourceMedia,
         localFallback: AutoTuneResult,
     ): AutoTuneResult {
-        val chain = buildList {
-            add(primaryModel)
-            openRouterPresets.forEach { if (it != primaryModel) add(it) }
+        val chain = getOpenRouterFallbackChain(primaryModel).ifEmpty {
+            return localFallback.copy(
+                fellBackToLocal = true,
+                fallbackReason = "Invalid OpenRouter model ID — applied Local offline Auto-Tune.",
+            )
         }
         val prompt = buildTelemetryPrompt(goal, customDirection, telemetry, source)
         var lastTransientError = "OpenRouter models busy"
 
-        for (modelId in chain) {
+        for ((index, modelId) in chain.withIndex()) {
             val payload = JSONObject().apply {
                 put("model", modelId)
                 put("temperature", 0.2)
@@ -285,7 +324,15 @@ object SmartAutoTuneEngine {
                         ?.optJSONObject("message")
                         ?.optString("content")
                         .orEmpty()
-                    val parsed = parseCloudJsonResult(content, AutoTuneEngineType.OPENROUTER_BYOK, modelId, localFallback)
+                    val resolvedModel = root.optString("model").trim().ifBlank { modelId }
+                    val displayModel = if (index > 0) "$resolvedModel (Fallback)" else resolvedModel
+                    val parsed = parseCloudJsonResult(
+                        rawText = content,
+                        engine = AutoTuneEngineType.OPENROUTER_BYOK,
+                        modelId = displayModel,
+                        baseline = localFallback,
+                        durationMs = source.durationMs,
+                    )
                     if (parsed != null) return parsed
                     lastTransientError = "Unparseable response from $modelId"
                 }
@@ -311,15 +358,16 @@ object SmartAutoTuneEngine {
         source: SourceMedia,
         localFallback: AutoTuneResult,
     ): AutoTuneResult {
-        val chain = buildList {
-            add(primaryModel)
-            geminiPresets.forEach { if (it != primaryModel) add(it) }
+        val chain = getGeminiFallbackChain(primaryModel).ifEmpty {
+            return localFallback.copy(
+                fellBackToLocal = true,
+                fallbackReason = "Invalid Gemini model ID — applied Local offline Auto-Tune.",
+            )
         }
         val prompt = buildTelemetryPrompt(goal, customDirection, telemetry, source)
         var lastTransientError = "Gemini models busy"
 
-        for (modelId in chain) {
-            val cleanModel = sanitizeModelId(modelId.removePrefix("models/")) ?: continue
+        for ((index, cleanModel) in chain.withIndex()) {
             val url = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent"
             val payload = JSONObject().apply {
                 put(
@@ -371,7 +419,14 @@ object SmartAutoTuneEngine {
                         ?.optJSONObject(0)
                         ?.optString("text")
                         .orEmpty()
-                    val parsed = parseCloudJsonResult(text, AutoTuneEngineType.GEMINI_BYOK, cleanModel, localFallback)
+                    val displayModel = if (index > 0) "$cleanModel (Fallback)" else cleanModel
+                    val parsed = parseCloudJsonResult(
+                        rawText = text,
+                        engine = AutoTuneEngineType.GEMINI_BYOK,
+                        modelId = displayModel,
+                        baseline = localFallback,
+                        durationMs = source.durationMs,
+                    )
                     if (parsed != null) return parsed
                     lastTransientError = "Unparseable response from $cleanModel"
                 }
@@ -393,57 +448,156 @@ object SmartAutoTuneEngine {
         customDirection: String,
         t: TelemetrySnapshot,
         source: SourceMedia,
-    ): String = """
-        Analyze this video telemetry and return ONLY a single JSON object with keys:
-        lookTitle (string), summary (string, max 160 chars),
-        brightness (float -0.25..0.25), contrast (float 0.8..1.4), saturation (float 0.7..1.5),
-        sharpen (float 0..0.7), denoiseEnabled (boolean),
-        volumeGain (float 0.7..1.7), loudnessNormalize (boolean), voiceClarityEq (boolean),
-        recommendedAspect (one of ORIGINAL, PORTRAIT_9_16, SQUARE_1_1, SOCIAL_4_5, LANDSCAPE_16_9),
-        recommendedSplitSec (int 15, 30, 45, or 60), recommendSilenceCut (boolean).
-        Style goal: ${goal.label} (${goal.hint}).
-        Custom user direction: ${customDirection.ifBlank { "None" }}.
-        Video: ${source.effectiveWidth}x${source.effectiveHeight}, duration ${source.durationMs / 1000}s.
-        Telemetry (${t.sampledFrames} keyframes): meanLuma=${round2(t.meanLuma)}, p05=${round2(t.p05Luma)}, p95=${round2(t.p95Luma)},
-        contrastSpread=${round2(t.contrastSpread)}, saturation=${round2(t.meanSaturation)},
-        edgeSharpness=${round2(t.edgeSharpness)}, shadowNoise=${round2(t.shadowNoise)},
-        audioRmsDb=${t.audioRmsDb.roundToInt()}, quietRatio=${round2(t.quietRatio)}.
-    """.trimIndent()
+    ): String {
+        val durSec = String.format(Locale.US, "%.1f", source.durationMs / 1000.0)
+        return """
+            Analyze this video telemetry and return ONLY a single JSON object with keys:
+            lookTitle (string), summary (string, max 160 chars),
+            brightness (float -0.25..0.25), contrast (float 0.8..1.4), saturation (float 0.7..1.5),
+            sharpen (float 0..0.7), denoiseEnabled (boolean),
+            volumeGain (float 0.7..1.7), loudnessNormalize (boolean), voiceClarityEq (boolean),
+            recommendedAspect (one of ORIGINAL, PORTRAIT_9_16, SQUARE_1_1, SOCIAL_4_5, LANDSCAPE_16_9),
+            recommendedSplitSec (int 15, 30, 45, or 60), recommendSilenceCut (boolean),
+            suggestedHighlights (array of up to 3 objects: { "label": string, "startSec": float, "endSec": float } within 0..$durSec).
+            Style goal: ${goal.label} (${goal.hint}).
+            Custom user direction: ${customDirection.ifBlank { "None" }}.
+            Video: ${source.effectiveWidth}x${source.effectiveHeight}, duration ${durSec}s.
+            Telemetry (${t.sampledFrames} keyframes): meanLuma=${round2(t.meanLuma)}, p05=${round2(t.p05Luma)}, p95=${round2(t.p95Luma)},
+            contrastSpread=${round2(t.contrastSpread)}, saturation=${round2(t.meanSaturation)},
+            edgeSharpness=${round2(t.edgeSharpness)}, shadowNoise=${round2(t.shadowNoise)},
+            audioRmsDb=${t.audioRmsDb.roundToInt()}, quietRatio=${round2(t.quietRatio)}.
+        """.trimIndent()
+    }
 
-    private fun parseCloudJsonResult(
+    internal fun parseCloudJsonResult(
         rawText: String,
         engine: AutoTuneEngineType,
         modelId: String,
         baseline: AutoTuneResult,
+        durationMs: Long = Long.MAX_VALUE,
     ): AutoTuneResult? {
         val start = rawText.indexOf('{')
         val end = rawText.lastIndexOf('}')
         if (start < 0 || end <= start) return null
         return runCatching {
             val obj = JSONObject(rawText.substring(start, end + 1))
-            val aspect = runCatching {
-                AspectPreset.valueOf(obj.optString("recommendedAspect", baseline.recommendedAspect.name))
-            }.getOrDefault(baseline.recommendedAspect)
+            val colorObj = obj.optJSONObject("color")
+            val audioObj = obj.optJSONObject("audio")
+            val framingObj = obj.optJSONObject("framing")
+            val pacingObj = obj.optJSONObject("pacing")
+
+            val rawAspect = framingObj?.optString("recommendedAspect")
+                ?.takeIf { it.isNotBlank() }
+                ?: obj.optString("recommendedAspect", baseline.recommendedAspect.name)
+            val aspect = parseAspectPreset(rawAspect, baseline.recommendedAspect)
+
+            val rawTitle = obj.optString("lookTitle")
+                .ifBlank { obj.optString("visualStyleName") }
+                .ifBlank { baseline.lookTitle }
+                .take(48)
+
+            val brightnessVal = colorObj?.optDouble("brightness", Double.NaN)
+                ?.takeUnless { it.isNaN() }
+                ?: obj.optDouble("brightness", baseline.brightness.toDouble())
+            val contrastVal = colorObj?.optDouble("contrast", Double.NaN)
+                ?.takeUnless { it.isNaN() }
+                ?: obj.optDouble("contrast", baseline.contrast.toDouble())
+            val saturationVal = colorObj?.optDouble("saturation", Double.NaN)
+                ?.takeUnless { it.isNaN() }
+                ?: obj.optDouble("saturation", baseline.saturation.toDouble())
+            val sharpenVal = colorObj?.optDouble("sharpen", Double.NaN)
+                ?.takeUnless { it.isNaN() }
+                ?: obj.optDouble("sharpen", baseline.sharpen.toDouble())
+            val denoiseVal = when {
+                colorObj?.has("denoise") == true -> colorObj.optBoolean("denoise", baseline.denoiseEnabled)
+                else -> obj.optBoolean("denoiseEnabled", baseline.denoiseEnabled)
+            }
+
+            val volumeVal = audioObj?.optDouble("volume", Double.NaN)
+                ?.takeUnless { it.isNaN() }
+                ?: obj.optDouble("volumeGain", baseline.volumeGain.toDouble())
+            val normalizeVal = when {
+                audioObj?.has("normalize") == true -> audioObj.optBoolean("normalize", baseline.loudnessNormalize)
+                else -> obj.optBoolean("loudnessNormalize", baseline.loudnessNormalize)
+            }
+            val voiceEqVal = when {
+                audioObj?.has("voiceEnhance") == true -> audioObj.optBoolean("voiceEnhance", baseline.voiceClarityEq)
+                else -> obj.optBoolean("voiceClarityEq", baseline.voiceClarityEq)
+            }
+
+            val splitSec = pacingObj?.optInt("recommendedIntervalSeconds", -1)
+                ?.takeIf { it > 0 }
+                ?: obj.optInt("recommendedSplitSec", baseline.recommendedSplitSec)
+            val silenceCut = when {
+                pacingObj?.has("suggestRemoveSilence") == true ->
+                    pacingObj.optBoolean("suggestRemoveSilence", baseline.recommendSilenceCut)
+                else -> obj.optBoolean("recommendSilenceCut", baseline.recommendSilenceCut)
+            }
+
+            val highlightsArr = obj.optJSONArray("suggestedHighlights")
+                ?: obj.optJSONArray("suggestedClips")
+            val parsedHighlights = parseSuggestedHighlights(highlightsArr, durationMs)
+
             baseline.copy(
                 engineUsed = engine,
                 modelUsed = modelId,
                 fellBackToLocal = false,
                 fallbackReason = null,
-                lookTitle = obj.optString("lookTitle", baseline.lookTitle).take(48),
-                summary = obj.optString("summary", baseline.summary).take(220),
-                brightness = round2(obj.optDouble("brightness", baseline.brightness.toDouble()).toFloat().coerceIn(-0.35f, 0.35f)),
-                contrast = round2(obj.optDouble("contrast", baseline.contrast.toDouble()).toFloat().coerceIn(0.6f, 1.5f)),
-                saturation = round2(obj.optDouble("saturation", baseline.saturation.toDouble()).toFloat().coerceIn(0.4f, 1.6f)),
-                sharpen = round2(obj.optDouble("sharpen", baseline.sharpen.toDouble()).toFloat().coerceIn(0f, 0.85f)),
-                denoiseEnabled = obj.optBoolean("denoiseEnabled", baseline.denoiseEnabled),
-                volumeGain = round2(obj.optDouble("volumeGain", baseline.volumeGain.toDouble()).toFloat().coerceIn(0.5f, 1.9f)),
-                loudnessNormalize = obj.optBoolean("loudnessNormalize", baseline.loudnessNormalize),
-                voiceClarityEq = obj.optBoolean("voiceClarityEq", baseline.voiceClarityEq),
+                lookTitle = rawTitle,
+                summary = obj.optString("summary", baseline.summary).ifBlank { baseline.summary }.take(220),
+                brightness = round2(brightnessVal.toFloat().coerceIn(-0.35f, 0.35f)),
+                contrast = round2(contrastVal.toFloat().coerceIn(0.6f, 1.5f)),
+                saturation = round2(saturationVal.toFloat().coerceIn(0.4f, 1.6f)),
+                sharpen = round2(sharpenVal.toFloat().coerceIn(0f, 0.85f)),
+                denoiseEnabled = denoiseVal,
+                volumeGain = round2(volumeVal.toFloat().coerceIn(0.5f, 1.9f)),
+                loudnessNormalize = normalizeVal,
+                voiceClarityEq = voiceEqVal,
                 recommendedAspect = aspect,
-                recommendedSplitSec = obj.optInt("recommendedSplitSec", baseline.recommendedSplitSec).coerceIn(5, 120),
-                recommendSilenceCut = obj.optBoolean("recommendSilenceCut", baseline.recommendSilenceCut),
+                recommendedSplitSec = splitSec.coerceIn(5, 120),
+                recommendSilenceCut = silenceCut,
+                suggestedHighlights = if (parsedHighlights.isNotEmpty()) parsedHighlights else baseline.suggestedHighlights,
             )
         }.getOrNull()
+    }
+
+    private fun parseAspectPreset(raw: String, fallback: AspectPreset): AspectPreset {
+        return when (raw.trim().lowercase(Locale.US)) {
+            "original" -> AspectPreset.ORIGINAL
+            "9:16", "portrait_9_16" -> AspectPreset.PORTRAIT_9_16
+            "1:1", "square_1_1" -> AspectPreset.SQUARE_1_1
+            "4:5", "social_4_5" -> AspectPreset.SOCIAL_4_5
+            "16:9", "landscape_16_9" -> AspectPreset.LANDSCAPE_16_9
+            else -> runCatching { AspectPreset.valueOf(raw.trim()) }.getOrDefault(fallback)
+        }
+    }
+
+    private fun parseSuggestedHighlights(arr: JSONArray?, durationMs: Long): List<SuggestedHighlight> {
+        if (arr == null || arr.length() == 0 || durationMs < 500L) return emptyList()
+        val out = mutableListOf<SuggestedHighlight>()
+        val maxItems = minOf(4, arr.length())
+        for (i in 0 until maxItems) {
+            val item = arr.optJSONObject(i) ?: continue
+            val rawStartMs = when {
+                item.has("startMs") -> item.optLong("startMs", -1L)
+                item.has("startSec") -> (item.optDouble("startSec", Double.NaN) * 1000.0).toLong()
+                item.has("startTime") -> (item.optDouble("startTime", Double.NaN) * 1000.0).toLong()
+                else -> -1L
+            }
+            val rawEndMs = when {
+                item.has("endMs") -> item.optLong("endMs", -1L)
+                item.has("endSec") -> (item.optDouble("endSec", Double.NaN) * 1000.0).toLong()
+                item.has("endTime") -> (item.optDouble("endTime", Double.NaN) * 1000.0).toLong()
+                else -> -1L
+            }
+            if (rawStartMs < 0L || rawEndMs <= rawStartMs) continue
+            val clampedStart = rawStartMs.coerceIn(0L, (durationMs - 500L).coerceAtLeast(0L))
+            val clampedEnd = rawEndMs.coerceIn(clampedStart, durationMs)
+            if (clampedEnd - clampedStart < 500L) continue
+            val label = item.optString("label").trim().ifBlank { "Highlight ${i + 1}" }.take(40)
+            out.add(SuggestedHighlight(label = label, startMs = clampedStart, endMs = clampedEnd))
+        }
+        return out.sortedBy { it.startMs }
     }
 
     fun sanitizeModelId(raw: String): String? {

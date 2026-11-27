@@ -41,9 +41,6 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ColorFilter
-import androidx.compose.ui.graphics.ColorMatrix
-import androidx.compose.ui.graphics.asComposeColorFilter
 import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -65,6 +62,7 @@ import coil.ImageLoader
 import coil.compose.AsyncImage
 import coil.decode.SvgDecoder
 import com.example.media.MediaStoreHelper
+import com.example.model.ClipSegment
 import com.example.model.CropRectNormalized
 import com.example.model.EditorUiState
 import com.example.model.FitMode
@@ -74,6 +72,25 @@ import com.example.model.formatTimecode
 import com.example.ui.theme.LocalStudioColors
 import com.example.ui.theme.StudioMonoSmall
 import kotlin.math.min
+
+fun computePreviewFadeMultiplier(
+    positionMs: Long,
+    activeClip: ClipSegment?,
+    fadeInSec: Float,
+    fadeOutSec: Float,
+): Float {
+    if (activeClip == null) return 1f
+    var factor = 1f
+    val elapsedSec = (positionMs - activeClip.startMs) / 1000f
+    val remainingSec = (activeClip.endMs - positionMs) / 1000f
+    if (fadeInSec > 0.05f && elapsedSec >= 0f && elapsedSec < fadeInSec) {
+        factor = min(factor, (elapsedSec / fadeInSec).coerceIn(0f, 1f))
+    }
+    if (fadeOutSec > 0.05f && remainingSec >= 0f && remainingSec < fadeOutSec) {
+        factor = min(factor, (remainingSec / fadeOutSec).coerceIn(0f, 1f))
+    }
+    return factor
+}
 
 @OptIn(UnstableApi::class)
 @Composable
@@ -97,17 +114,14 @@ fun VideoPreviewViewport(
         source.aspectRatio.coerceAtLeast(0.1f)
     }
     val targetAspect = if (compare) baseAspect else (visual.aspectPreset.ratio ?: baseAspect)
-
-    // Live color matrix for instant 60fps preview (Compose + TextureView hardware layer)
-    val liveColorFilter: ColorFilter? = remember(
-        compare,
-        visual.brightness,
-        visual.contrast,
-        visual.saturation,
-    ) {
-        if (compare) null
-        else ColorFilter.colorMatrix(
-            ColorMatrix(MediaStoreHelper.buildColorMatrix(visual).array)
+    val videoFadeOpacity = if (compare) {
+        1f
+    } else {
+        computePreviewFadeMultiplier(
+            positionMs = state.playheadMs,
+            activeClip = state.activeClip,
+            fadeInSec = visual.videoFadeInSec,
+            fadeOutSec = visual.videoFadeOutSec,
         )
     }
 
@@ -210,14 +224,25 @@ fun VideoPreviewViewport(
                     update = { pv ->
                         if (pv.player !== player) pv.player = player
                         if (pv.resizeMode != resizeMode) pv.resizeMode = resizeMode
-                        // Apply live TextureView color filter when API >= 31 or software fallback tint
+                        // Apply live color matrix (brightness, contrast, saturation & sharpen crispness) on all API levels
                         val tex = findTextureView(pv)
-                        if (tex != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        if (tex != null) {
                             if (compare) {
-                                tex.setRenderEffect(null)
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                    tex.setRenderEffect(null)
+                                } else {
+                                    tex.setLayerPaint(null)
+                                }
                             } else {
-                                val cm = android.graphics.ColorMatrix(MediaStoreHelper.buildColorMatrix(visual).array)
-                                tex.setRenderEffect(RenderEffect.createColorFilterEffect(android.graphics.ColorMatrixColorFilter(cm)))
+                                val cm = android.graphics.ColorMatrix(
+                                    MediaStoreHelper.buildPreviewColorMatrix(visual).array
+                                )
+                                val cf = android.graphics.ColorMatrixColorFilter(cm)
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                    tex.setRenderEffect(RenderEffect.createColorFilterEffect(cf))
+                                } else {
+                                    tex.setLayerPaint(android.graphics.Paint().apply { colorFilter = cf })
+                                }
                             }
                         }
                     },
@@ -227,14 +252,13 @@ fun VideoPreviewViewport(
                     modifier = Modifier.fillMaxSize(),
                 )
 
-                // Lightweight color-wash preview overlay for API < 31 so brightness/contrast changes are always visible live
-                if (!compare && Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-                    val b = visual.brightness
-                    if (b > 0.02f) {
-                        Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = (b * 0.45f).coerceIn(0f, 0.35f))))
-                    } else if (b < -0.02f) {
-                        Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = (-b * 0.65f).coerceIn(0f, 0.55f))))
-                    }
+                // Live Video Fade-In / Fade-Out transition preview across all API levels
+                if (videoFadeOpacity < 0.995f) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black.copy(alpha = (1f - videoFadeOpacity).coerceIn(0f, 1f)))
+                    )
                 }
             }
 
@@ -279,8 +303,8 @@ fun VideoPreviewViewport(
                 )
             }
 
-            // Before / After "Compare Original" toggle pill when visual tuning is active
-            if (visual.hasVisualAdjustments || state.overlayConfig.hasActiveOverlays) {
+            // Before / After "Compare Original" toggle pill when visual, overlay, or audio tuning is active
+            if (visual.hasVisualAdjustments || state.overlayConfig.hasActiveOverlays || state.audioMotionConfig.hasAudioOrMotionEffects) {
                 Surface(
                     modifier = Modifier
                         .align(Alignment.TopStart)

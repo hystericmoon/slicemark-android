@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.example.model.AspectPreset
+import com.example.model.AutoTuneEngineType
 import com.example.model.FitMode
 import com.example.model.HistoryEntry
 import com.example.model.HistoryEntryType
@@ -15,6 +16,14 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import org.json.JSONArray
 import org.json.JSONObject
+
+data class AutoTunePrefs(
+    val engine: AutoTuneEngineType = AutoTuneEngineType.LOCAL,
+    val openRouterPreset: String = "auto",
+    val openRouterCustomModel: String = "",
+    val geminiPreset: String = "auto",
+    val geminiCustomModel: String = "",
+)
 
 private val Context.slicemarkDataStore: DataStore<Preferences> by preferencesDataStore(
     name = "slicemark_studio_prefs",
@@ -26,6 +35,11 @@ class LocalPreferencesRepository(private val context: Context) {
         private const val MAX_HISTORY_ITEMS = 20
         private val KEY_DARK_THEME = booleanPreferencesKey("dark_theme")
         private val KEY_HISTORY_JSON = stringPreferencesKey("local_history_json")
+        private val KEY_AUTOTUNE_ENGINE = stringPreferencesKey("autotune_engine")
+        private val KEY_AUTOTUNE_OR_PRESET = stringPreferencesKey("autotune_openrouter_preset")
+        private val KEY_AUTOTUNE_OR_CUSTOM = stringPreferencesKey("autotune_openrouter_custom")
+        private val KEY_AUTOTUNE_GEMINI_PRESET = stringPreferencesKey("autotune_gemini_preset")
+        private val KEY_AUTOTUNE_GEMINI_CUSTOM = stringPreferencesKey("autotune_gemini_custom")
     }
 
     val darkThemeFlow: Flow<Boolean> = context.slicemarkDataStore.data.map { prefs ->
@@ -36,9 +50,52 @@ class LocalPreferencesRepository(private val context: Context) {
         decodeHistory(prefs[KEY_HISTORY_JSON].orEmpty())
     }
 
+    val autoTunePrefsFlow: Flow<AutoTunePrefs> = context.slicemarkDataStore.data.map { prefs ->
+        val engineName = prefs[KEY_AUTOTUNE_ENGINE].orEmpty()
+        val engine = runCatching { AutoTuneEngineType.valueOf(engineName) }
+            .getOrDefault(AutoTuneEngineType.LOCAL)
+        AutoTunePrefs(
+            engine = engine,
+            openRouterPreset = prefs[KEY_AUTOTUNE_OR_PRESET]?.takeIf { it.isNotBlank() } ?: "auto",
+            openRouterCustomModel = prefs[KEY_AUTOTUNE_OR_CUSTOM].orEmpty(),
+            geminiPreset = prefs[KEY_AUTOTUNE_GEMINI_PRESET]?.takeIf { it.isNotBlank() } ?: "auto",
+            geminiCustomModel = prefs[KEY_AUTOTUNE_GEMINI_CUSTOM].orEmpty(),
+        )
+    }
+
     suspend fun setDarkTheme(dark: Boolean) {
         context.slicemarkDataStore.edit { prefs ->
             prefs[KEY_DARK_THEME] = dark
+        }
+    }
+
+    suspend fun setAutoTuneEngine(engine: AutoTuneEngineType) {
+        context.slicemarkDataStore.edit { prefs ->
+            prefs[KEY_AUTOTUNE_ENGINE] = engine.name
+        }
+    }
+
+    suspend fun setOpenRouterModelPreset(model: String) {
+        context.slicemarkDataStore.edit { prefs ->
+            prefs[KEY_AUTOTUNE_OR_PRESET] = model
+        }
+    }
+
+    suspend fun setOpenRouterCustomModel(model: String) {
+        context.slicemarkDataStore.edit { prefs ->
+            prefs[KEY_AUTOTUNE_OR_CUSTOM] = model
+        }
+    }
+
+    suspend fun setGeminiModelPreset(model: String) {
+        context.slicemarkDataStore.edit { prefs ->
+            prefs[KEY_AUTOTUNE_GEMINI_PRESET] = model
+        }
+    }
+
+    suspend fun setGeminiCustomModel(model: String) {
+        context.slicemarkDataStore.edit { prefs ->
+            prefs[KEY_AUTOTUNE_GEMINI_CUSTOM] = model
         }
     }
 

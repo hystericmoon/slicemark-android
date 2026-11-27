@@ -72,6 +72,14 @@ enum class AutoTuneEngineType(val label: String, val badge: String) {
     GEMINI_BYOK("Gemini BYOK", "Cloud • Own Key"),
 }
 
+enum class PlatformPreset(val id: String, val title: String, val subtitle: String) {
+    REELS("reels", "Reels / Shorts", "9:16 · 15s · MP4"),
+    TIKTOK("tiktok", "TikTok", "9:16 · 60s · MP4"),
+    WHATSAPP("whatsapp", "WhatsApp", "16 MB max · 720p"),
+    DISCORD("discord", "Discord", "10 MB max · 480p"),
+    SQUARE("square", "Square Feed", "1:1 · 30s · MP4"),
+}
+
 enum class ExportTargetMode(val label: String) {
     SEPARATE_CLIPS("Separate Clips"),
     MERGE_HIGHLIGHT("Merge Highlight"),
@@ -206,6 +214,7 @@ data class OverlayConfig(
     val subtitleFileName: String? = null,
     val subtitles: List<SubtitleCue> = emptyList(),
     val burnInCaptions: Boolean = false,
+    val includeSlicedSrt: Boolean = true,
 ) {
     val hasActiveOverlays: Boolean
         get() = autoPartStamp ||
@@ -224,7 +233,7 @@ data class AudioMotionConfig(
     val voiceClarityEq: Boolean = false,
     val bgTrackUri: Uri? = null,
     val bgTrackName: String? = null,
-    val bgTrackVolume: Float = 0.25f, // 0..1
+    val bgTrackVolume: Float = 0.25f, // 0..1.5
     val playbackSpeed: Float = 1.0f,  // 0.5..2.0
     val loopActiveClip: Boolean = true,
     val reverseEnabled: Boolean = false,
@@ -300,9 +309,9 @@ data class AutoTuneUiState(
     val goal: AutoTuneGoal = AutoTuneGoal.BALANCED_AUTO,
     val customDirection: String = "",
     val selectedEngine: AutoTuneEngineType = AutoTuneEngineType.LOCAL,
-    val openRouterModelPreset: String = "meta-llama/llama-3.3-70b-instruct:free",
+    val openRouterModelPreset: String = "auto",
     val openRouterCustomModel: String = "",
-    val geminiModelPreset: String = "gemini-2.5-flash",
+    val geminiModelPreset: String = "auto",
     val geminiCustomModel: String = "",
     val hasOpenRouterKey: Boolean = false,
     val hasGeminiKey: Boolean = false,

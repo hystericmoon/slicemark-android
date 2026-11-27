@@ -3,7 +3,11 @@ package com.example
 import com.example.autotune.SmartAutoTuneEngine
 import com.example.media.MediaAnalyzer
 import com.example.media.MediaStoreHelper
+import com.example.media.RealtimeAudioDspKernel
+import com.example.media.VideoExportEngine
+import com.example.model.AspectPreset
 import com.example.model.AudioMotionConfig
+import com.example.model.AutoTuneEngineType
 import com.example.model.AutoTuneGoal
 import com.example.model.ClipSegment
 import com.example.model.EditorUiState
@@ -18,6 +22,7 @@ import com.example.model.SubtitleAndChapterParser
 import com.example.model.TelemetrySnapshot
 import com.example.model.TrimConfig
 import com.example.model.VisualConfig
+import com.example.ui.components.computePreviewFadeMultiplier
 import com.example.viewmodel.EditorViewModel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -26,6 +31,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.nio.ShortBuffer
 
 class SlicemarkCoreUnitTest {
 
@@ -163,6 +169,28 @@ class SlicemarkCoreUnitTest {
         )
         assertEquals(4, nParts.size)
         assertEquals(15_000L, nParts[0].durationMs)
+
+        // Custom N-Parts up to 50 and Custom Max MB down to 1 MB
+        val nParts50 = EditorViewModel.computeBatchClipsPure(
+            durationMs = 100_000L,
+            fileSizeBytes = 20_000_000L,
+            bitrateBps = 1_600_000L,
+            displayName = "long.mp4",
+            trim = TrimConfig(splitMethod = SplitMethod.N_PARTS, targetPartCount = 50),
+            silences = emptyList(),
+        )
+        assertEquals(50, nParts50.size)
+
+        val maxMb1 = EditorViewModel.computeBatchClipsPure(
+            durationMs = 40_000L,
+            fileSizeBytes = 40L * 1024L * 1024L,
+            bitrateBps = 8_000_000L,
+            displayName = "tiny.mp4",
+            trim = TrimConfig(splitMethod = SplitMethod.MAX_MB, maxFileSizeMb = 1),
+            silences = emptyList(),
+        )
+        assertTrue(maxMb1.size >= 10)
+        assertTrue(maxMb1.first().durationMs <= 3_500L)
 
         // Target Max MB (10 MB Discord target on 40 MB / 40s video -> ~9s chunks)
         val maxMb = EditorViewModel.computeBatchClipsPure(
@@ -311,5 +339,68 @@ class SlicemarkCoreUnitTest {
         // Encrypted BYOK key vault excluded from cloud backups and device transfer
         assertTrue(backupRules.contains("slicemark_byok_vault.xml"))
         assertTrue(dataExtractionRules.contains("slicemark_byok_vault.xml"))
+    }
+
+    // 8. Auto-Tune Auto Model Fallback Chains
+    @Test
+    fun autoTuneAutoChainsWork() {
+        assertEquals(
+            listOf("gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"),
+            SmartAutoTuneEngine.getGeminiFallbackChain("auto"),
+        )
+        assertEquals(
+            listOf("gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"),
+            SmartAutoTuneEngine.getGeminiFallbackChain("gemini-2.5-pro"),
+        )
+        assertEquals(
+            listOf("openrouter/free", "google/gemma-3-27b-it:free", "qwen/qwen2.5-vl-72b-instruct:free"),
+            SmartAutoTuneEngine.getOpenRouterFallbackChain("auto"),
+        )
+        assertEquals(
+            listOf("openai/gpt-4o-mini", "openrouter/free"),
+            SmartAutoTuneEngine.getOpenRouterFallbackChain("openai/gpt-4o-mini"),
+        )
+    }
+
+    // 9. Export Bitrate Scaling, Preview Fades & Real-Time Audio DSP Kernel
+    @Test
+    fun exportBitrateScalingAndPreviewDspParityWork() {
+        val high1080 = VideoExportEngine.computeTargetVideoBitrate(
+            ExportResolution.P1080,
+            ExportQualityPreset.HIGH,
+            8_000_000L,
+        )
+        val balanced1080 = VideoExportEngine.computeTargetVideoBitrate(
+            ExportResolution.P1080,
+            ExportQualityPreset.BALANCED,
+            8_000_000L,
+        )
+        val compact480 = VideoExportEngine.computeTargetVideoBitrate(
+            ExportResolution.P480,
+            ExportQualityPreset.COMPACT,
+            8_000_000L,
+        )
+        assertEquals(6_000_000, high1080)
+        assertTrue(balanced1080 in 4_000_000..4_500_000)
+        assertTrue(compact480 in 700_000..900_000)
+
+        val clip = ClipSegment(startMs = 2_000L, endMs = 12_000L)
+        assertEquals(0.5f, computePreviewFadeMultiplier(3_000L, clip, fadeInSec = 2f, fadeOutSec = 2f), 0.01f)
+        assertEquals(1.0f, computePreviewFadeMultiplier(7_000L, clip, fadeInSec = 2f, fadeOutSec = 2f), 0.01f)
+        assertEquals(0.25f, computePreviewFadeMultiplier(11_500L, clip, fadeInSec = 2f, fadeOutSec = 2f), 0.01f)
+
+        val kernel = RealtimeAudioDspKernel().apply { configure(44_100, 1) }
+        val input = ShortArray(8) { 4000 }
+        val output = ShortArray(8)
+        kernel.processBlock(
+            inShorts = ShortBuffer.wrap(input),
+            outShorts = ShortBuffer.wrap(output),
+            sampleCount = input.size,
+            baseGain = 1.5f,
+            loudnessNormalize = true,
+            voiceClarityEq = true,
+            frameFadeProvider = { 0.5f },
+        )
+        assertTrue("Processed DSP output should contain non-zero audio", output.any { it != 0.toShort() })
     }
 }

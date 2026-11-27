@@ -13,10 +13,13 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import androidx.annotation.OptIn
+import androidx.media3.common.C
 import androidx.media3.common.Effect
+import androidx.media3.common.Format
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.audio.SonicAudioProcessor
+import androidx.media3.common.util.MediaFormatUtil
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.BitmapOverlay
 import androidx.media3.effect.Contrast
@@ -26,7 +29,9 @@ import androidx.media3.effect.OverlayEffect
 import androidx.media3.effect.Presentation
 import androidx.media3.effect.RgbAdjustment
 import androidx.media3.effect.ScaleAndRotateTransformation
+import androidx.media3.muxer.Muxer
 import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.EditedMediaItemSequence
 import androidx.media3.transformer.Effects
@@ -34,7 +39,9 @@ import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
 import com.example.model.AudioMotionConfig
+import com.google.common.collect.ImmutableList
 import com.example.model.ClipSegment
 import com.example.model.ExportConfig
 import com.example.model.ExportFormat
@@ -79,7 +86,7 @@ data class ExportJobOutcome(
 
 object VideoExportEngine {
 
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
     suspend fun runExportJob(
         context: Context,
@@ -96,6 +103,7 @@ object VideoExportEngine {
 
         val producedFiles = mutableListOf<Triple<File, String, String>>() // file, displayName, mimeType
         val zipExtraFiles = mutableListOf<Pair<File, String>>() // SRTs & poster JPGs
+        var usedWebmToMp4Fallback = false
 
         try {
             val isMerge = request.export.targetMode == ExportTargetMode.MERGE_HIGHLIGHT && clips.size > 1
@@ -105,20 +113,21 @@ object VideoExportEngine {
                 if (isCancelled()) throw InterruptedException("Export cancelled")
                 onProgress(0, 1, 0.05f, "Merging ${clips.size} clips into highlight reel…")
                 val outExt = resolveOutputExtension(request.export.format)
-                val outMime = resolveOutputMime(request.export.format)
                 val outName = "${baseName}_highlight.$outExt"
                 val outFile = File(workDir, outName)
 
-                exportHighlightReel(
+                val result = exportHighlightReel(
                     context = context,
                     request = request,
                     clips = clips,
                     logoBitmap = logoBitmap,
                     outputFile = outFile,
+                    displayBaseName = "${baseName}_highlight",
                     isCancelled = isCancelled,
                     onStepProgress = { p -> onProgress(0, 1, p, "Rendering highlight reel ${(p * 100).roundToInt()}%") },
                 )
-                producedFiles.add(Triple(outFile, outName, outMime))
+                if (result.usedMp4Fallback) usedWebmToMp4Fallback = true
+                producedFiles.add(Triple(result.file, result.displayName, result.mimeType))
 
                 if (request.export.includePosterJpgs) {
                     createPosterJpg(context, request, clips.first(), 0, clips.size, logoBitmap, File(workDir, "${baseName}_highlight_cover.jpg"))?.let {
@@ -131,8 +140,8 @@ object VideoExportEngine {
                     val partNum = String.format("%02d", idx + 1)
                     val secTag = "${(clip.durationMs / 1000L).coerceAtLeast(1)}s"
                     val outExt = resolveOutputExtension(request.export.format)
-                    val outMime = resolveOutputMime(request.export.format)
-                    val outName = "${baseName}_${partNum}_${secTag}.$outExt"
+                    val clipBase = "${baseName}_${partNum}_${secTag}"
+                    val outName = "$clipBase.$outExt"
                     val outFile = File(workDir, outName)
 
                     onProgress(
@@ -142,7 +151,7 @@ object VideoExportEngine {
                         "Exporting clip ${idx + 1}/$totalSteps (${request.export.format.label})…",
                     )
 
-                    exportSingleClip(
+                    val result = exportSingleClip(
                         context = context,
                         request = request,
                         clip = clip,
@@ -150,16 +159,18 @@ object VideoExportEngine {
                         totalClips = clips.size,
                         logoBitmap = logoBitmap,
                         outputFile = outFile,
+                        displayBaseName = clipBase,
                         isCancelled = isCancelled,
                         onClipProgress = { p ->
                             val overall = (idx + p) / totalSteps
                             onProgress(idx, totalSteps, overall, "Clip ${idx + 1}/$totalSteps • ${(p * 100).roundToInt()}%")
                         },
                     )
-                    producedFiles.add(Triple(outFile, outName, outMime))
+                    if (result.usedMp4Fallback) usedWebmToMp4Fallback = true
+                    producedFiles.add(Triple(result.file, result.displayName, result.mimeType))
 
-                    // Auto-slice re-timed SRT per clip when subtitles are loaded
-                    if (request.overlay.subtitles.isNotEmpty()) {
+                    // Auto-slice re-timed SRT per clip when subtitles are loaded and enabled
+                    if (request.overlay.subtitles.isNotEmpty() && request.overlay.includeSlicedSrt) {
                         val srtText = SubtitleAndChapterParser.sliceAndRetimeSrtForClip(
                             cues = request.overlay.subtitles,
                             clipStartMs = clip.startMs,
@@ -224,8 +235,21 @@ object VideoExportEngine {
                         )
                     }
                 }
+                val srtExtras = zipExtraFiles.filter { it.second.endsWith(".srt", ignoreCase = true) }
+                for ((file, name) in srtExtras) {
+                    if (file.exists()) {
+                        savedUris.add(
+                            MediaStoreHelper.saveFileToMediaStore(
+                                context = context,
+                                sourceFile = file,
+                                displayName = name,
+                                mimeType = "application/x-subrip",
+                            )
+                        )
+                    }
+                }
                 if (request.export.includePosterJpgs) {
-                    for ((file, name) in zipExtraFiles.filter { it.second.endsWith(".jpg") }) {
+                    for ((file, name) in zipExtraFiles.filter { it.second.endsWith(".jpg", ignoreCase = true) }) {
                         savedUris.add(
                             MediaStoreHelper.saveFileToMediaStore(
                                 context = context,
@@ -241,10 +265,13 @@ object VideoExportEngine {
                     request.export.format == ExportFormat.GIF -> "Downloads/Slicemark"
                     else -> "Movies/Slicemark"
                 }
+                val srtNote = if (srtExtras.isNotEmpty()) " + ${srtExtras.size} SRT" else ""
+                val fallbackNote = if (usedWebmToMp4Fallback) " (WebM unsupported — saved as MP4)" else ""
                 summary = if (producedFiles.size == 1) {
-                    "Saved ${producedFiles.first().second} to $folderLabel"
+                    "Saved ${producedFiles.first().second}$srtNote to $folderLabel$fallbackNote"
                 } else {
-                    "Saved ${producedFiles.size} ${request.export.format.label} files to $folderLabel"
+                    val formatLabel = if (usedWebmToMp4Fallback) "MP4" else request.export.format.label
+                    "Saved ${producedFiles.size} $formatLabel files$srtNote to $folderLabel$fallbackNote"
                 }
             }
 
@@ -255,6 +282,13 @@ object VideoExportEngine {
         }
     }
 
+    private data class ExportedMediaResult(
+        val file: File,
+        val displayName: String,
+        val mimeType: String,
+        val usedMp4Fallback: Boolean = false,
+    )
+
     private suspend fun exportSingleClip(
         context: Context,
         request: ExportJobRequest,
@@ -263,9 +297,10 @@ object VideoExportEngine {
         totalClips: Int,
         logoBitmap: Bitmap?,
         outputFile: File,
+        displayBaseName: String,
         isCancelled: () -> Boolean,
         onClipProgress: (Float) -> Unit,
-    ) {
+    ): ExportedMediaResult {
         val fmt = request.export.format
         val isUntouchedMp4 = fmt == ExportFormat.MP4 &&
             request.export.resolution == ExportResolution.ORIGINAL &&
@@ -274,7 +309,7 @@ object VideoExportEngine {
             !request.overlay.hasActiveOverlays &&
             !request.audioMotion.hasAudioOrMotionEffects
 
-        when {
+        return when {
             fmt == ExportFormat.WAV -> {
                 onClipProgress(0.3f)
                 AudioTrackExporter.exportClipsAudioToWav(
@@ -285,6 +320,7 @@ object VideoExportEngine {
                     outputWavFile = outputFile,
                 )
                 onClipProgress(1f)
+                ExportedMediaResult(outputFile, "$displayBaseName.wav", ExportFormat.WAV.mimeType)
             }
             fmt == ExportFormat.MP3 -> {
                 onClipProgress(0.25f)
@@ -318,6 +354,7 @@ object VideoExportEngine {
                     )
                 }
                 onClipProgress(1f)
+                ExportedMediaResult(outputFile, "$displayBaseName.m4a", "audio/mp4")
             }
             fmt == ExportFormat.GIF -> {
                 exportAnimatedGif(
@@ -331,6 +368,7 @@ object VideoExportEngine {
                     isCancelled = isCancelled,
                     onProgress = onClipProgress,
                 )
+                ExportedMediaResult(outputFile, "$displayBaseName.gif", ExportFormat.GIF.mimeType)
             }
             isUntouchedMp4 -> {
                 val ok = runCatching {
@@ -351,17 +389,10 @@ object VideoExportEngine {
                         onProgress = onClipProgress,
                     )
                 }
+                ExportedMediaResult(outputFile, "$displayBaseName.mp4", ExportFormat.MP4.mimeType)
             }
-            request.audioMotion.reverseEnabled ||
-                request.audioMotion.boomerangEnabled ||
-                request.visual.fitMode != FitMode.CROP_FILL ||
-                request.visual.videoFadeInSec > 0.01f ||
-                request.visual.videoFadeOutSec > 0.01f ||
-                request.visual.sharpen > 0.02f ||
-                request.visual.denoiseEnabled ||
-                (request.overlay.burnInCaptions && request.overlay.subtitles.isNotEmpty()) -> {
-                // Full styled frame-buffer renderer supports Reverse, Boomerang, Blur Backdrop, Solid Matte, Sharpen/Denoise, Video Fades, Burn-In Captions & synchronized DSP AAC audio
-                exportStyledFrameBufferedVideo(
+            requiresStyledFrameBuffer(request) -> {
+                exportStyledVideoForFormat(
                     context = context,
                     request = request,
                     clips = listOf(clip),
@@ -369,6 +400,7 @@ object VideoExportEngine {
                     totalClips = totalClips,
                     logoBitmap = logoBitmap,
                     outputFile = outputFile,
+                    displayBaseName = displayBaseName,
                     isCancelled = isCancelled,
                     onProgress = onClipProgress,
                 )
@@ -390,7 +422,15 @@ object VideoExportEngine {
                         onProgress = onClipProgress,
                     )
                 }.isSuccess
-                if (!transformed || !outputFile.exists() || outputFile.length() < 1024L) {
+                val validOutput = transformed && outputFile.exists() && outputFile.length() >= 1024L &&
+                    (!useWebm || isValidWebmFile(outputFile))
+                if (validOutput) {
+                    val ext = if (useWebm) "webm" else "mp4"
+                    val mime = if (useWebm) ExportFormat.WEBM.mimeType else ExportFormat.MP4.mimeType
+                    ExportedMediaResult(outputFile, "$displayBaseName.$ext", mime)
+                } else {
+                    if (useWebm) runCatching { outputFile.delete() }
+                    val mp4File = if (useWebm) File(outputFile.parentFile, "$displayBaseName.mp4") else outputFile
                     exportStyledFrameBufferedVideo(
                         context = context,
                         request = request,
@@ -398,10 +438,11 @@ object VideoExportEngine {
                         clipIndex = clipIndex,
                         totalClips = totalClips,
                         logoBitmap = logoBitmap,
-                        outputFile = outputFile,
+                        outputFile = mp4File,
                         isCancelled = isCancelled,
                         onProgress = onClipProgress,
                     )
+                    ExportedMediaResult(mp4File, "$displayBaseName.mp4", ExportFormat.MP4.mimeType, usedMp4Fallback = useWebm)
                 }
             }
         }
@@ -413,39 +454,50 @@ object VideoExportEngine {
         clips: List<ClipSegment>,
         logoBitmap: Bitmap?,
         outputFile: File,
+        displayBaseName: String,
         isCancelled: () -> Boolean,
         onStepProgress: (Float) -> Unit,
-    ) {
-        when (request.export.format) {
-            ExportFormat.GIF -> exportAnimatedGif(
-                context, request, clips, 0, clips.size, logoBitmap, outputFile, isCancelled, onStepProgress
-            )
+    ): ExportedMediaResult {
+        return when (request.export.format) {
+            ExportFormat.GIF -> {
+                exportAnimatedGif(
+                    context, request, clips, 0, clips.size, logoBitmap, outputFile, isCancelled, onStepProgress
+                )
+                ExportedMediaResult(outputFile, "$displayBaseName.gif", ExportFormat.GIF.mimeType)
+            }
             ExportFormat.WAV -> {
                 AudioTrackExporter.exportClipsAudioToWav(
                     context, request.source.uri, clips, request.audioMotion, outputFile
                 )
                 onStepProgress(1f)
+                ExportedMediaResult(outputFile, "$displayBaseName.wav", ExportFormat.WAV.mimeType)
             }
             ExportFormat.MP3 -> {
                 AudioTrackExporter.exportClipsAudioToM4a(
                     context, request.source.uri, clips, request.audioMotion, outputFile
                 )
                 onStepProgress(1f)
+                ExportedMediaResult(outputFile, "$displayBaseName.m4a", "audio/mp4")
             }
             else -> {
                 val useCanvasRenderer = request.export.highlightFadeDipSec > 0.02f ||
-                    request.audioMotion.reverseEnabled ||
-                    request.audioMotion.boomerangEnabled ||
                     request.audioMotion.bgTrackUri != null ||
-                    request.visual.fitMode != FitMode.CROP_FILL ||
-                    request.visual.sharpen > 0.01f ||
-                    request.visual.denoiseEnabled ||
-                    (request.overlay.burnInCaptions && request.overlay.subtitles.isNotEmpty())
+                    requiresStyledFrameBuffer(request)
                 if (useCanvasRenderer) {
-                    exportStyledFrameBufferedVideo(
-                        context, request, clips, 0, clips.size, logoBitmap, outputFile, isCancelled, onStepProgress
+                    exportStyledVideoForFormat(
+                        context = context,
+                        request = request,
+                        clips = clips,
+                        clipIndex = 0,
+                        totalClips = clips.size,
+                        logoBitmap = logoBitmap,
+                        outputFile = outputFile,
+                        displayBaseName = displayBaseName,
+                        isCancelled = isCancelled,
+                        onProgress = onStepProgress,
                     )
                 } else {
+                    val useWebm = request.export.format == ExportFormat.WEBM
                     val ok = runCatching {
                         runMedia3Transformer(
                             context = context,
@@ -456,19 +508,116 @@ object VideoExportEngine {
                             logoBitmap = logoBitmap,
                             outputFile = outputFile,
                             audioOnly = false,
-                            useWebm = request.export.format == ExportFormat.WEBM,
+                            useWebm = useWebm,
                             isCancelled = isCancelled,
                             onProgress = onStepProgress,
                         )
                     }.isSuccess
-                    if (!ok) {
+                    val validOutput = ok && outputFile.exists() && outputFile.length() >= 1024L &&
+                        (!useWebm || isValidWebmFile(outputFile))
+                    if (validOutput) {
+                        val ext = if (useWebm) "webm" else "mp4"
+                        val mime = if (useWebm) ExportFormat.WEBM.mimeType else ExportFormat.MP4.mimeType
+                        ExportedMediaResult(outputFile, "$displayBaseName.$ext", mime)
+                    } else {
+                        if (useWebm) runCatching { outputFile.delete() }
+                        val mp4File = if (useWebm) File(outputFile.parentFile, "$displayBaseName.mp4") else outputFile
                         exportStyledFrameBufferedVideo(
-                            context, request, clips, 0, clips.size, logoBitmap, outputFile, isCancelled, onStepProgress
+                            context, request, clips, 0, clips.size, logoBitmap, mp4File, isCancelled, onStepProgress
                         )
+                        ExportedMediaResult(mp4File, "$displayBaseName.mp4", ExportFormat.MP4.mimeType, usedMp4Fallback = useWebm)
                     }
                 }
             }
         }
+    }
+
+    private fun requiresStyledFrameBuffer(request: ExportJobRequest): Boolean {
+        return request.audioMotion.reverseEnabled ||
+            request.audioMotion.boomerangEnabled ||
+            request.visual.fitMode != FitMode.CROP_FILL ||
+            request.visual.videoFadeInSec > 0.01f ||
+            request.visual.videoFadeOutSec > 0.01f ||
+            request.visual.sharpen > 0.02f ||
+            request.visual.denoiseEnabled ||
+            (request.overlay.burnInCaptions && request.overlay.subtitles.isNotEmpty())
+    }
+
+    private suspend fun exportStyledVideoForFormat(
+        context: Context,
+        request: ExportJobRequest,
+        clips: List<ClipSegment>,
+        clipIndex: Int,
+        totalClips: Int,
+        logoBitmap: Bitmap?,
+        outputFile: File,
+        displayBaseName: String,
+        isCancelled: () -> Boolean,
+        onProgress: (Float) -> Unit,
+    ): ExportedMediaResult {
+        if (request.export.format != ExportFormat.WEBM) {
+            exportStyledFrameBufferedVideo(
+                context = context,
+                request = request,
+                clips = clips,
+                clipIndex = clipIndex,
+                totalClips = totalClips,
+                logoBitmap = logoBitmap,
+                outputFile = outputFile,
+                isCancelled = isCancelled,
+                onProgress = onProgress,
+            )
+            return ExportedMediaResult(outputFile, "$displayBaseName.mp4", ExportFormat.MP4.mimeType)
+        }
+
+        // Render styled MP4 intermediate, then transcode to true WebM; if device lacks WebM codecs, return as MP4 (never MP4 inside .webm)
+        val tempMp4 = File(outputFile.parentFile, "${displayBaseName}_styled_tmp.mp4")
+        exportStyledFrameBufferedVideo(
+            context = context,
+            request = request,
+            clips = clips,
+            clipIndex = clipIndex,
+            totalClips = totalClips,
+            logoBitmap = logoBitmap,
+            outputFile = tempMp4,
+            isCancelled = isCancelled,
+            onProgress = { p -> onProgress(p * 0.7f) },
+        )
+        val transcoded = runCatching {
+            transcodeMp4ToWebm(
+                context = context,
+                request = request,
+                sourceMp4 = tempMp4,
+                outputWebm = outputFile,
+                isCancelled = isCancelled,
+                onProgress = { p -> onProgress(0.7f + p * 0.3f) },
+            )
+        }.isSuccess
+        if (transcoded && isValidWebmFile(outputFile)) {
+            runCatching { tempMp4.delete() }
+            return ExportedMediaResult(outputFile, "$displayBaseName.webm", ExportFormat.WEBM.mimeType)
+        }
+
+        runCatching { outputFile.delete() }
+        val finalMp4 = File(outputFile.parentFile, "$displayBaseName.mp4")
+        if (tempMp4.absolutePath != finalMp4.absolutePath) {
+            tempMp4.renameTo(finalMp4)
+        }
+        return ExportedMediaResult(finalMp4, "$displayBaseName.mp4", ExportFormat.MP4.mimeType, usedMp4Fallback = true)
+    }
+
+    private fun isValidWebmFile(file: File): Boolean {
+        if (!file.exists() || file.length() < 64L) return false
+        return runCatching {
+            FileInputStream(file).use { fis ->
+                val header = ByteArray(4)
+                fis.read(header) == 4 &&
+                    header[0] == 0x1A.toByte() &&
+                    header[1] == 0x45.toByte() &&
+                    header[2] == 0xDF.toByte() &&
+                    header[3] == 0xA3.toByte()
+            }
+        }.getOrDefault(false)
     }
 
     /**
@@ -688,60 +837,258 @@ object VideoExportEngine {
 
                 val composition = Composition.Builder(sequences).build()
                 val builder = Transformer.Builder(context)
+                if (!audioOnly) {
+                    val targetBitrate = computeTargetVideoBitrate(
+                        resolution = request.export.resolution,
+                        qualityPreset = request.export.qualityPreset,
+                        sourceBitrateBps = request.source.bitrateBps,
+                    )
+                    val encoderFactory = DefaultEncoderFactory.Builder(context)
+                        .setRequestedVideoEncoderSettings(
+                            VideoEncoderSettings.Builder()
+                                .setBitrate(targetBitrate)
+                                .build()
+                        )
+                        .build()
+                    builder.setEncoderFactory(encoderFactory)
+                }
                 if (useWebm) {
                     builder.setVideoMimeType(MimeTypes.VIDEO_VP9)
                     builder.setAudioMimeType(MimeTypes.AUDIO_OPUS)
+                    builder.setMuxerFactory(WebmMuxerFactory())
                 } else if (audioOnly) {
                     builder.setAudioMimeType(MimeTypes.AUDIO_AAC)
                 }
 
-                var progressRunnable: Runnable? = null
-                val transformer = builder.addListener(object : Transformer.Listener {
-                    override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                        progressRunnable?.let { mainHandler.removeCallbacks(it) }
-                        onProgress(1f)
-                        if (cont.isActive) cont.resume(Unit)
-                    }
-
-                    override fun onError(
-                        composition: Composition,
-                        exportResult: ExportResult,
-                        exportException: ExportException,
-                    ) {
-                        progressRunnable?.let { mainHandler.removeCallbacks(it) }
-                        if (cont.isActive) cont.resumeWithException(exportException)
-                    }
-                }).build()
-
-                val holder = ProgressHolder()
-                progressRunnable = object : Runnable {
-                    override fun run() {
-                        if (isCancelled()) {
-                            transformer.cancel()
-                            if (cont.isActive) cont.resumeWithException(InterruptedException("Cancelled"))
-                            return
-                        }
-                        val state = transformer.getProgress(holder)
-                        if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
-                            onProgress((holder.progress / 100f).coerceIn(0f, 0.99f))
-                        }
-                        if (cont.isActive) mainHandler.postDelayed(this, 180L)
-                    }
-                }
-
-                cont.invokeOnCancellation {
-                    mainHandler.post {
-                        progressRunnable.let { mainHandler.removeCallbacks(it) }
-                        transformer.cancel()
-                    }
-                }
-
-                transformer.start(composition, outputFile.absolutePath)
-                mainHandler.postDelayed(progressRunnable, 180L)
+                startTransformerAsync(
+                    builder = builder,
+                    composition = composition,
+                    outputFile = outputFile,
+                    isCancelled = isCancelled,
+                    onProgress = onProgress,
+                    cont = cont,
+                )
             } catch (t: Throwable) {
                 if (cont.isActive) cont.resumeWithException(t)
             }
         }
+    }
+
+    @OptIn(UnstableApi::class)
+    private suspend fun transcodeMp4ToWebm(
+        context: Context,
+        request: ExportJobRequest,
+        sourceMp4: File,
+        outputWebm: File,
+        isCancelled: () -> Boolean,
+        onProgress: (Float) -> Unit,
+    ) = suspendCancellableCoroutine<Unit> { cont ->
+        mainHandler.post {
+            try {
+                val edited = EditedMediaItem.Builder(MediaItem.fromUri(Uri.fromFile(sourceMp4)))
+                    .setRemoveAudio(request.audioMotion.muted && request.audioMotion.bgTrackUri == null)
+                    .build()
+                val composition = Composition.Builder(EditedMediaItemSequence.Builder(listOf(edited)).build()).build()
+                val targetBitrate = computeTargetVideoBitrate(
+                    resolution = request.export.resolution,
+                    qualityPreset = request.export.qualityPreset,
+                    sourceBitrateBps = request.source.bitrateBps,
+                )
+                val builder = Transformer.Builder(context)
+                    .setEncoderFactory(
+                        DefaultEncoderFactory.Builder(context)
+                            .setRequestedVideoEncoderSettings(
+                                VideoEncoderSettings.Builder().setBitrate(targetBitrate).build()
+                            )
+                            .build()
+                    )
+                    .setVideoMimeType(MimeTypes.VIDEO_VP9)
+                    .setAudioMimeType(MimeTypes.AUDIO_OPUS)
+                    .setMuxerFactory(WebmMuxerFactory())
+
+                startTransformerAsync(
+                    builder = builder,
+                    composition = composition,
+                    outputFile = outputWebm,
+                    isCancelled = isCancelled,
+                    onProgress = onProgress,
+                    cont = cont,
+                )
+            } catch (t: Throwable) {
+                if (cont.isActive) cont.resumeWithException(t)
+            }
+        }
+    }
+
+    @OptIn(UnstableApi::class)
+    private fun startTransformerAsync(
+        builder: Transformer.Builder,
+        composition: Composition,
+        outputFile: File,
+        isCancelled: () -> Boolean,
+        onProgress: (Float) -> Unit,
+        cont: kotlinx.coroutines.CancellableContinuation<Unit>,
+    ) {
+        var progressRunnable: Runnable? = null
+        val transformer = builder.addListener(object : Transformer.Listener {
+            override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                progressRunnable?.let { mainHandler.removeCallbacks(it) }
+                onProgress(1f)
+                if (cont.isActive) cont.resume(Unit)
+            }
+
+            override fun onError(
+                composition: Composition,
+                exportResult: ExportResult,
+                exportException: ExportException,
+            ) {
+                progressRunnable?.let { mainHandler.removeCallbacks(it) }
+                if (cont.isActive) cont.resumeWithException(exportException)
+            }
+        }).build()
+
+        val holder = ProgressHolder()
+        var lastProgress = -1
+        var lastProgressAtMs = android.os.SystemClock.elapsedRealtime()
+        progressRunnable = object : Runnable {
+            override fun run() {
+                if (!cont.isActive) return
+                if (isCancelled()) {
+                    transformer.cancel()
+                    if (cont.isActive) cont.resumeWithException(InterruptedException("Cancelled"))
+                    return
+                }
+                val now = android.os.SystemClock.elapsedRealtime()
+                val state = transformer.getProgress(holder)
+                if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
+                    if (holder.progress != lastProgress) {
+                        lastProgress = holder.progress
+                        lastProgressAtMs = now
+                    }
+                    onProgress((holder.progress / 100f).coerceIn(0f, 0.99f))
+                }
+                val stallLimitMs = if (lastProgress <= 0) 6_000L else 15_000L
+                if (now - lastProgressAtMs >= stallLimitMs) {
+                    transformer.cancel()
+                    if (cont.isActive) {
+                        cont.resumeWithException(
+                            IllegalStateException("Media3 Transformer stalled at ${lastProgress.coerceAtLeast(0)}%")
+                        )
+                    }
+                    return
+                }
+                if (cont.isActive) mainHandler.postDelayed(this, 180L)
+            }
+        }
+
+        cont.invokeOnCancellation {
+            mainHandler.post {
+                progressRunnable.let { mainHandler.removeCallbacks(it) }
+                transformer.cancel()
+            }
+        }
+
+        transformer.start(composition, outputFile.absolutePath)
+        mainHandler.postDelayed(progressRunnable, 180L)
+    }
+
+    @OptIn(UnstableApi::class)
+    private class WebmMuxerFactory : Muxer.Factory {
+        override fun create(path: String): Muxer {
+            return try {
+                WebmMuxer(MediaMuxer(path, MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM))
+            } catch (t: Throwable) {
+                throw Muxer.MuxerException("Error creating WebM muxer", t)
+            }
+        }
+
+        override fun getSupportedSampleMimeTypes(trackType: @C.TrackType Int): ImmutableList<String> {
+            return when (trackType) {
+                C.TRACK_TYPE_VIDEO -> ImmutableList.of(MimeTypes.VIDEO_VP9, MimeTypes.VIDEO_VP8)
+                C.TRACK_TYPE_AUDIO -> ImmutableList.of(MimeTypes.AUDIO_OPUS, MimeTypes.AUDIO_VORBIS)
+                else -> ImmutableList.of()
+            }
+        }
+    }
+
+    @OptIn(UnstableApi::class)
+    private class WebmMuxer(private val mediaMuxer: MediaMuxer) : Muxer {
+        private class TrackTokenImpl(val trackIndex: Int) : Muxer.TrackToken
+
+        private var isStarted = false
+        private var isReleased = false
+
+        override fun addTrack(format: Format): Muxer.TrackToken {
+            val mime = format.sampleMimeType
+                ?: throw Muxer.MuxerException("Missing sampleMimeType", IllegalArgumentException("Missing sampleMimeType"))
+            val mf = if (MimeTypes.isVideo(mime)) {
+                MediaFormat.createVideoFormat(mime, format.width, format.height).also {
+                    MediaFormatUtil.maybeSetColorInfo(it, format.colorInfo)
+                }
+            } else {
+                MediaFormat.createAudioFormat(mime, format.sampleRate, format.channelCount).also {
+                    MediaFormatUtil.maybeSetString(it, MediaFormat.KEY_LANGUAGE, format.language)
+                }
+            }
+            MediaFormatUtil.setCsdBuffers(mf, format.initializationData)
+            val idx = try {
+                mediaMuxer.addTrack(mf)
+            } catch (t: Throwable) {
+                throw Muxer.MuxerException("Failed to add WebM track $mime", t)
+            }
+            return TrackTokenImpl(idx)
+        }
+
+        override fun writeSampleData(
+            trackToken: Muxer.TrackToken,
+            byteBuffer: ByteBuffer,
+            bufferInfo: MediaCodec.BufferInfo,
+        ) {
+            if (!isStarted) {
+                try {
+                    mediaMuxer.start()
+                    isStarted = true
+                } catch (t: Throwable) {
+                    throw Muxer.MuxerException("Failed to start WebM muxer", t)
+                }
+            }
+            try {
+                mediaMuxer.writeSampleData((trackToken as TrackTokenImpl).trackIndex, byteBuffer, bufferInfo)
+            } catch (t: Throwable) {
+                throw Muxer.MuxerException("Failed to write WebM sample", t)
+            }
+        }
+
+        override fun addMetadataEntry(metadataEntry: androidx.media3.common.Metadata.Entry) = Unit
+
+        override fun close() {
+            if (isReleased) return
+            try {
+                if (isStarted) mediaMuxer.stop()
+            } catch (t: Throwable) {
+                throw Muxer.MuxerException("Failed to stop WebM muxer", t)
+            } finally {
+                mediaMuxer.release()
+                isReleased = true
+            }
+        }
+    }
+
+    fun computeTargetVideoBitrate(
+        resolution: ExportResolution,
+        qualityPreset: ExportQualityPreset,
+        sourceBitrateBps: Long,
+    ): Int {
+        val baseBitrate = when (resolution) {
+            ExportResolution.P480 -> 1_600_000
+            ExportResolution.P720 -> 3_200_000
+            ExportResolution.P1080 -> 6_000_000
+            ExportResolution.ORIGINAL -> {
+                if (sourceBitrateBps > 0L) sourceBitrateBps.toInt().coerceIn(2_000_000, 12_000_000)
+                else 4_500_000
+            }
+        }
+        return (baseBitrate * qualityPreset.bitrateScale).roundToInt().coerceIn(500_000, 14_000_000)
     }
 
     /**
@@ -836,7 +1183,11 @@ object VideoExportEngine {
             )
             val includeAudio = processedAudio != null && processedAudio.samples.isNotEmpty()
 
-            val bitrate = (3_200_000 * request.export.qualityPreset.bitrateScale).roundToInt().coerceIn(900_000, 6_000_000)
+            val bitrate = computeTargetVideoBitrate(
+                resolution = request.export.resolution,
+                qualityPreset = request.export.qualityPreset,
+                sourceBitrateBps = request.source.bitrateBps,
+            )
             val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, outW, outH).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
@@ -1026,17 +1377,17 @@ object VideoExportEngine {
         onProgress: (Float) -> Unit,
     ) {
         val retriever = MediaMetadataRetriever()
-        val gifFps = 10
+        val gifFps = 12
         val delayMs = 1000 / gifFps
         val speed = request.audioMotion.playbackSpeed.coerceIn(0.5f, 2.0f)
-        val gifShortSide = min(360, request.export.resolution.maxShortSide ?: 360)
+        val gifShortSide = min(480, request.export.resolution.maxShortSide ?: 480)
 
         try {
             MediaAnalyzer.setDataSourceSafe(context, retriever, request.source.uri)
             val timestamps = mutableListOf<Pair<Long, Int>>()
             for ((cIdx, clip) in clips.withIndex()) {
                 val outDurMs = (clip.durationMs / speed).toLong().coerceAtLeast(300L)
-                val count = ((outDurMs * gifFps) / 1000L).toInt().coerceIn(3, 140)
+                val count = ((outDurMs * gifFps) / 1000L).toInt().coerceIn(3, 180)
                 val list = (0 until count).map { f ->
                     val frac = f.toFloat() / max(1, count - 1)
                     (clip.startMs + (frac * clip.durationMs).toLong()) to (clipIndex + cIdx)

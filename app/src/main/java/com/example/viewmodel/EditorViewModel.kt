@@ -1,6 +1,7 @@
 package com.example.viewmodel
 
 import android.app.Application
+import android.content.Context
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
@@ -11,7 +12,10 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
 import com.example.autotune.InvalidApiKeyException
 import com.example.autotune.SmartAutoTuneEngine
 import com.example.data.LocalPreferencesRepository
@@ -19,8 +23,11 @@ import com.example.data.SecureKeyStore
 import com.example.media.AudioAnalysisResult
 import com.example.media.ExportCoordinator
 import com.example.media.ExportJobRequest
+import com.example.media.LivePreviewAudioProcessor
+import com.example.media.LivePreviewAudioState
 import com.example.media.MediaAnalyzer
 import com.example.media.MediaStoreHelper
+import com.example.ui.components.computePreviewFadeMultiplier
 import com.example.model.AspectPreset
 import com.example.model.AudioMotionConfig
 import com.example.model.AutoTuneEngineType
@@ -42,6 +49,7 @@ import com.example.model.HistoryEntryType
 import com.example.model.ManualMode
 import com.example.model.OverlayConfig
 import com.example.model.OverlayCorner
+import com.example.model.PlatformPreset
 import com.example.model.RemainderPolicy
 import com.example.model.SourceMedia
 import com.example.model.SplitMethod
@@ -51,7 +59,11 @@ import com.example.model.TrimConfig
 import com.example.model.TrimWorkflow
 import com.example.model.VisualConfig
 import com.example.model.formatCompactDuration
+import com.example.model.formatTimecode
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.withContext
+import java.io.File
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -82,7 +94,31 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     )
     val uiState: StateFlow<EditorUiState> = _uiState.asStateFlow()
 
-    val player: ExoPlayer = ExoPlayer.Builder(application).build()
+    private val liveAudioProcessor = LivePreviewAudioProcessor()
+    private val bgAudioProcessor = LivePreviewAudioProcessor()
+    private var loadedBgUri: Uri? = null
+
+    val player: ExoPlayer = buildProcessorPlayer(application, liveAudioProcessor)
+    private val bgPlayer: ExoPlayer = buildProcessorPlayer(application, bgAudioProcessor).apply {
+        repeatMode = Player.REPEAT_MODE_ALL
+    }
+
+    private fun buildProcessorPlayer(context: Context, processor: LivePreviewAudioProcessor): ExoPlayer {
+        val renderersFactory = object : DefaultRenderersFactory(context) {
+            override fun buildAudioSink(
+                ctx: Context,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean,
+            ): AudioSink {
+                return DefaultAudioSink.Builder(ctx)
+                    .setEnableFloatOutput(enableFloatOutput)
+                    .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                    .setAudioProcessors(arrayOf(processor))
+                    .build()
+            }
+        }
+        return ExoPlayer.Builder(context, renderersFactory).build()
+    }
 
     private val undoStack = ArrayDeque<EditorSnapshot>()
     private val redoStack = ArrayDeque<EditorSnapshot>()
@@ -110,6 +146,21 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             }
         }
         viewModelScope.launch {
+            prefsRepo.autoTunePrefsFlow.collect { atPrefs ->
+                _uiState.update { s ->
+                    s.copy(
+                        autoTune = s.autoTune.copy(
+                            selectedEngine = atPrefs.engine,
+                            openRouterModelPreset = atPrefs.openRouterPreset,
+                            openRouterCustomModel = atPrefs.openRouterCustomModel,
+                            geminiModelPreset = atPrefs.geminiPreset,
+                            geminiCustomModel = atPrefs.geminiCustomModel,
+                        )
+                    )
+                }
+            }
+        }
+        viewModelScope.launch {
             ExportCoordinator.state.collect { exportState ->
                 _uiState.update { it.copy(exportProgress = exportState) }
                 val summary = exportState.lastCompletedSummary
@@ -124,7 +175,13 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 _uiState.update { it.copy(isPlaying = isPlaying) }
-                if (isPlaying) startPlayheadPolling() else stopPlayheadPolling()
+                if (isPlaying) {
+                    startPlayheadPolling()
+                    syncBgPlayback(isPlaying = true)
+                } else {
+                    stopPlayheadPolling()
+                    syncBgPlayback(isPlaying = false)
+                }
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -136,6 +193,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                         player.play()
                     } else {
                         _uiState.update { it.copy(isPlaying = false) }
+                        syncBgPlayback(isPlaying = false)
                     }
                 }
             }
@@ -147,6 +205,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         playheadPollJob?.cancel()
         val framesToRecycle = _uiState.value.filmstripFrames
         player.release()
+        bgPlayer.release()
         framesToRecycle.forEach { if (!it.isRecycled) it.recycle() }
         super.onCleared()
     }
@@ -154,6 +213,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun pausePlayback() {
         if (player.isPlaying) {
             player.pause()
+        }
+        if (bgPlayer.isPlaying) {
+            bgPlayer.pause()
         }
     }
 
@@ -166,9 +228,12 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 val active = state.activeClip
                 if (active != null && state.audioMotionConfig.loopActiveClip && pos >= active.endMs) {
                     player.seekTo(active.startMs)
+                    syncBgPosition(active.startMs, active)
                     _uiState.update { it.copy(playheadMs = active.startMs) }
+                    updateLiveAudioFade(active.startMs)
                 } else {
                     _uiState.update { it.copy(playheadMs = pos) }
+                    updateLiveAudioFade(pos)
                 }
                 delay(40L)
             }
@@ -177,7 +242,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     private fun stopPlayheadPolling() {
         playheadPollJob?.cancel()
-        _uiState.update { it.copy(playheadMs = player.currentPosition.coerceAtLeast(0L)) }
+        val pos = player.currentPosition.coerceAtLeast(0L)
+        _uiState.update { it.copy(playheadMs = pos) }
+        updateLiveAudioFade(pos)
     }
 
     // --- Theme & Navigation ---
@@ -222,6 +289,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         analysisJob?.cancel()
         player.pause()
         player.clearMediaItems()
+        bgPlayer.pause()
+        bgPlayer.clearMediaItems()
+        loadedBgUri = null
         undoStack.clear()
         redoStack.clear()
         cachedTelemetry = null
@@ -295,7 +365,10 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             player.setMediaItem(MediaItem.fromUri(uri))
             player.prepare()
             player.seekTo(initialClips.firstOrNull()?.startMs ?: 0L)
-            syncPlayerParameters(_uiState.value.audioMotionConfig)
+            bgPlayer.pause()
+            bgPlayer.clearMediaItems()
+            loadedBgUri = null
+            syncPlayerParameters(AudioMotionConfig())
         }
 
         _uiState.update {
@@ -360,10 +433,15 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun seekTo(ms: Long) {
-        val dur = _uiState.value.sourceMedia?.durationMs ?: return
+        val state = _uiState.value
+        val dur = state.sourceMedia?.durationMs ?: return
         val clamped = ms.coerceIn(0L, dur)
         player.seekTo(clamped)
         _uiState.update { it.copy(playheadMs = clamped) }
+        updateLiveAudioFade(clamped)
+        if (player.isPlaying) {
+            syncBgPosition(clamped, state.activeClip)
+        }
     }
 
     fun scrubTimelineTo(rawMs: Long) {
@@ -399,6 +477,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     fun toggleCompareOriginal() {
         _uiState.update { it.copy(compareOriginal = !it.compareOriginal) }
+        syncPlayerParameters(_uiState.value.audioMotionConfig)
     }
 
     fun toggleCropReticle() {
@@ -596,6 +675,53 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(clips = next, activeClipId = nextActive) }
     }
 
+    fun renameClip(clipId: String, newLabel: String) {
+        val trimmed = newLabel.trim()
+        val existing = _uiState.value.clips.firstOrNull { it.id == clipId } ?: return
+        val resolved = trimmed.ifBlank { existing.label.ifBlank { "Clip" } }
+        if (resolved == existing.label) return
+        pushUndoSnapshot()
+        _uiState.update { state ->
+            state.copy(
+                clips = state.clips.map { clip ->
+                    if (clip.id == clipId) {
+                        clip.copy(
+                            label = resolved,
+                            chapterTitle = if (clip.chapterTitle != null) resolved else null,
+                        )
+                    } else clip
+                }
+            )
+        }
+    }
+
+    fun addManualClipAtPlayhead() {
+        val state = _uiState.value
+        val source = state.sourceMedia ?: return
+        pushUndoSnapshot()
+        val lenMs = min(state.trimConfig.intervalSec * 1000L, source.durationMs).coerceAtLeast(500L)
+        val maxStart = (source.durationMs - lenMs).coerceAtLeast(0L)
+        val startMs = state.playheadMs.coerceIn(0L, maxStart)
+        val endMs = (startMs + lenMs).coerceAtMost(source.durationMs)
+        val newClip = ClipSegment(
+            label = "clip_${String.format("%02d", state.clips.size + 1)}",
+            startMs = startMs,
+            endMs = endMs,
+            isSelected = true,
+        )
+        _uiState.update {
+            it.copy(
+                trimConfig = it.trimConfig.copy(
+                    workflow = TrimWorkflow.MANUAL,
+                    manualMode = ManualMode.KEEP_SEGMENTS,
+                ),
+                clips = it.clips + newClip,
+                activeClipId = newClip.id,
+                toastMessage = "Added clip at ${formatTimecode(startMs, false)}",
+            )
+        }
+    }
+
     fun updateTrimConfig(recalculateClips: Boolean = true, transform: (TrimConfig) -> TrimConfig) {
         val state = _uiState.value
         val source = state.sourceMedia ?: return
@@ -790,6 +916,34 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun exportChaptersJsonToDevice() {
+        val clips = _uiState.value.clips
+        if (clips.isEmpty()) {
+            showToast("No clips available to export.")
+            return
+        }
+        viewModelScope.launch {
+            val saved = withContext(Dispatchers.IO) {
+                runCatching {
+                    val json = SubtitleAndChapterParser.exportChaptersJson(clips)
+                    val outDir = File(getApplication<Application>().cacheDir, "exports").apply { mkdirs() }
+                    val tmp = File(outDir, "slicemark_chapters.json")
+                    tmp.writeText(json)
+                    MediaStoreHelper.saveFileToMediaStore(
+                        context = getApplication(),
+                        sourceFile = tmp,
+                        displayName = "slicemark_chapters.json",
+                        mimeType = "application/json",
+                    )
+                }.getOrNull()
+            }
+            showToast(
+                if (saved != null) "Saved slicemark_chapters.json to Downloads/Slicemark"
+                else "Unable to save chapters JSON."
+            )
+        }
+    }
+
     private fun computeBatchClips(
         source: SourceMedia,
         trim: TrimConfig,
@@ -830,7 +984,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     fun updateVisual(recordUndo: Boolean = false, transform: (VisualConfig) -> VisualConfig) {
         if (recordUndo) pushUndoSnapshot()
+        val wasComparing = _uiState.value.compareOriginal
         _uiState.update { it.copy(visualConfig = transform(it.visualConfig), compareOriginal = false) }
+        if (wasComparing) syncPlayerParameters(_uiState.value.audioMotionConfig)
     }
 
     fun rotate90() {
@@ -910,9 +1066,88 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun syncPlayerParameters(audio: AudioMotionConfig) {
+        val state = _uiState.value
+        val compare = state.compareOriginal
+        val fadeMul = computePreviewFadeMultiplier(
+            positionMs = state.playheadMs,
+            activeClip = state.activeClip,
+            fadeInSec = audio.audioFadeInSec,
+            fadeOutSec = audio.audioFadeOutSec,
+        )
+        liveAudioProcessor.liveState = LivePreviewAudioState(
+            muted = audio.muted,
+            volumeGain = audio.volumeGain,
+            loudnessNormalize = audio.loudnessNormalize,
+            voiceClarityEq = audio.voiceClarityEq,
+            fadeMultiplier = fadeMul,
+            bypassAll = compare,
+        )
+        bgAudioProcessor.liveState = LivePreviewAudioState(
+            muted = compare,
+            volumeGain = audio.bgTrackVolume.coerceIn(0f, 1.5f),
+            loudnessNormalize = false,
+            voiceClarityEq = false,
+            fadeMultiplier = 1f,
+            bypassAll = false,
+        )
         mainHandler.post {
-            player.volume = if (audio.muted) 0f else audio.volumeGain.coerceIn(0f, 1f)
+            player.volume = if (!compare && audio.muted) 0f else 1f
             player.playbackParameters = PlaybackParameters(audio.playbackSpeed.coerceIn(0.5f, 2.0f))
+
+            val bgUri = audio.bgTrackUri
+            if (bgUri == null) {
+                if (loadedBgUri != null) {
+                    bgPlayer.pause()
+                    bgPlayer.clearMediaItems()
+                    loadedBgUri = null
+                }
+            } else {
+                if (loadedBgUri != bgUri) {
+                    loadedBgUri = bgUri
+                    bgPlayer.setMediaItem(MediaItem.fromUri(bgUri))
+                    bgPlayer.prepare()
+                }
+                bgPlayer.volume = if (compare) 0f else 1f
+                if (player.isPlaying && !compare) {
+                    syncBgPosition(_uiState.value.playheadMs, _uiState.value.activeClip)
+                    if (!bgPlayer.isPlaying) bgPlayer.play()
+                } else if (bgPlayer.isPlaying) {
+                    bgPlayer.pause()
+                }
+            }
+        }
+    }
+
+    private fun updateLiveAudioFade(posMs: Long) {
+        val state = _uiState.value
+        val audio = state.audioMotionConfig
+        val fadeMul = computePreviewFadeMultiplier(
+            positionMs = posMs,
+            activeClip = state.activeClip,
+            fadeInSec = audio.audioFadeInSec,
+            fadeOutSec = audio.audioFadeOutSec,
+        )
+        liveAudioProcessor.liveState = liveAudioProcessor.liveState.copy(fadeMultiplier = fadeMul)
+    }
+
+    private fun syncBgPlayback(isPlaying: Boolean) {
+        val state = _uiState.value
+        if (loadedBgUri == null || state.audioMotionConfig.bgTrackUri == null) return
+        if (isPlaying && !state.compareOriginal) {
+            syncBgPosition(player.currentPosition.coerceAtLeast(0L), state.activeClip)
+            bgPlayer.play()
+        } else if (bgPlayer.isPlaying) {
+            bgPlayer.pause()
+        }
+    }
+
+    private fun syncBgPosition(playheadMs: Long, activeClip: ClipSegment?) {
+        if (loadedBgUri == null) return
+        val relMs = if (activeClip != null) (playheadMs - activeClip.startMs).coerceAtLeast(0L) else playheadMs
+        val bgDur = bgPlayer.duration
+        val targetMs = if (bgDur > 0L && bgDur != androidx.media3.common.C.TIME_UNSET) relMs % bgDur else relMs
+        if (abs(bgPlayer.currentPosition - targetMs) > 150L) {
+            bgPlayer.seekTo(targetMs)
         }
     }
 
@@ -928,22 +1163,33 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setAutoTuneEngine(engine: AutoTuneEngineType) {
         _uiState.update { it.copy(autoTune = it.autoTune.copy(selectedEngine = engine, errorMessage = null)) }
+        viewModelScope.launch { prefsRepo.setAutoTuneEngine(engine) }
     }
 
     fun setOpenRouterModelPreset(model: String) {
         _uiState.update { it.copy(autoTune = it.autoTune.copy(openRouterModelPreset = model)) }
+        viewModelScope.launch { prefsRepo.setOpenRouterModelPreset(model) }
     }
 
     fun setOpenRouterCustomModel(model: String) {
         _uiState.update { it.copy(autoTune = it.autoTune.copy(openRouterCustomModel = model)) }
+        viewModelScope.launch { prefsRepo.setOpenRouterCustomModel(model) }
     }
 
     fun setGeminiModelPreset(model: String) {
         _uiState.update { it.copy(autoTune = it.autoTune.copy(geminiModelPreset = model)) }
+        viewModelScope.launch { prefsRepo.setGeminiModelPreset(model) }
     }
 
     fun setGeminiCustomModel(model: String) {
         _uiState.update { it.copy(autoTune = it.autoTune.copy(geminiCustomModel = model)) }
+        viewModelScope.launch { prefsRepo.setGeminiCustomModel(model) }
+    }
+
+    fun getSavedByokKey(engine: AutoTuneEngineType): String = when (engine) {
+        AutoTuneEngineType.OPENROUTER_BYOK -> keyStore.getOpenRouterKey()
+        AutoTuneEngineType.GEMINI_BYOK -> keyStore.getGeminiKey()
+        AutoTuneEngineType.LOCAL -> ""
     }
 
     fun saveByokKey(engine: AutoTuneEngineType, key: String) {
@@ -1204,6 +1450,78 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(exportConfig = transform(it.exportConfig)) }
     }
 
+    fun applyPlatformPreset(preset: PlatformPreset) {
+        val state = _uiState.value
+        val source = state.sourceMedia ?: return
+        pushUndoSnapshot()
+
+        var nextVisual = state.visualConfig
+        var nextExport = state.exportConfig
+        var nextTrim = state.trimConfig.copy(workflow = TrimWorkflow.BATCH_SPLIT)
+        val toast = when (preset) {
+            PlatformPreset.REELS -> {
+                nextVisual = nextVisual.copy(aspectPreset = AspectPreset.PORTRAIT_9_16)
+                nextExport = nextExport.copy(
+                    format = ExportFormat.MP4,
+                    resolution = ExportResolution.P1080,
+                    qualityPreset = ExportQualityPreset.BALANCED,
+                )
+                nextTrim = nextTrim.copy(splitMethod = SplitMethod.INTERVAL, intervalSec = 15)
+                "Applied Reels 9:16 · 15s split preset"
+            }
+            PlatformPreset.TIKTOK -> {
+                nextVisual = nextVisual.copy(aspectPreset = AspectPreset.PORTRAIT_9_16)
+                nextExport = nextExport.copy(
+                    format = ExportFormat.MP4,
+                    resolution = ExportResolution.P1080,
+                    qualityPreset = ExportQualityPreset.BALANCED,
+                )
+                nextTrim = nextTrim.copy(splitMethod = SplitMethod.INTERVAL, intervalSec = 60)
+                "Applied TikTok 9:16 · 60s split preset"
+            }
+            PlatformPreset.WHATSAPP -> {
+                nextExport = nextExport.copy(
+                    format = ExportFormat.MP4,
+                    resolution = ExportResolution.P720,
+                    qualityPreset = ExportQualityPreset.COMPACT,
+                )
+                nextTrim = nextTrim.copy(splitMethod = SplitMethod.MAX_MB, maxFileSizeMb = 16)
+                "Applied WhatsApp 16 MB · 720p preset"
+            }
+            PlatformPreset.DISCORD -> {
+                nextExport = nextExport.copy(
+                    format = ExportFormat.MP4,
+                    resolution = ExportResolution.P480,
+                    qualityPreset = ExportQualityPreset.COMPACT,
+                )
+                nextTrim = nextTrim.copy(splitMethod = SplitMethod.MAX_MB, maxFileSizeMb = 10)
+                "Applied Discord 10 MB · 480p preset"
+            }
+            PlatformPreset.SQUARE -> {
+                nextVisual = nextVisual.copy(aspectPreset = AspectPreset.SQUARE_1_1)
+                nextExport = nextExport.copy(
+                    format = ExportFormat.MP4,
+                    resolution = ExportResolution.P1080,
+                    qualityPreset = ExportQualityPreset.BALANCED,
+                )
+                nextTrim = nextTrim.copy(splitMethod = SplitMethod.INTERVAL, intervalSec = 30)
+                "Applied Square 1:1 · 30s split preset"
+            }
+        }
+        val nextClips = computeBatchClips(source, nextTrim, state.detectedSilenceRanges)
+        _uiState.update {
+            it.copy(
+                visualConfig = nextVisual,
+                exportConfig = nextExport,
+                trimConfig = nextTrim,
+                clips = nextClips,
+                activeClipId = nextClips.firstOrNull()?.id,
+                compareOriginal = false,
+                toastMessage = toast,
+            )
+        }
+    }
+
     fun startExport(clipsOverride: List<ClipSegment>? = null) {
         val state = _uiState.value
         val source = state.sourceMedia ?: return
@@ -1247,7 +1565,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 SplitMethod.INTERVAL -> (trim.intervalSec.coerceIn(3, 600) * 1000L)
                 SplitMethod.N_PARTS -> (dur / trim.targetPartCount.coerceIn(2, 50)).coerceAtLeast(1000L)
                 SplitMethod.MAX_MB -> {
-                    val targetBytes = trim.maxFileSizeMb.coerceIn(2, 500) * 1024L * 1024L
+                    val targetBytes = trim.maxFileSizeMb.coerceIn(1, 500) * 1024L * 1024L
                     val bytesPerSec = if (fileSizeBytes > 0L) {
                         (fileSizeBytes.toDouble() / (dur / 1000.0)).coerceAtLeast(64_000.0)
                     } else {

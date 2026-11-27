@@ -13,11 +13,15 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.History
@@ -43,9 +47,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.model.ClipSegment
 import com.example.model.ExportProgressState
 import com.example.model.HistoryEntry
 import com.example.model.HistoryEntryType
@@ -218,43 +225,149 @@ fun LocalHistorySheet(
     }
 }
 
+private enum class ChaptersModalTab(val label: String) {
+    IMPORT("Paste to Split"),
+    EXPORT("Export Chapters"),
+}
+
 @Composable
 fun ChaptersTimestampDialog(
-    initialText: String,
+    clips: List<ClipSegment>,
+    totalDurationMs: Long,
     onApplyChapters: (String) -> Unit,
+    onExportJson: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var text by remember { mutableStateOf(initialText) }
+    val studio = LocalStudioColors.current
+    val clipboard = LocalClipboardManager.current
+    var activeTab by remember { mutableStateOf(ChaptersModalTab.IMPORT) }
+    var text by remember { mutableStateOf("") }
+    var copied by remember { mutableStateOf(false) }
+
+    val sampleChapters = remember {
+        "00:00 Opening Hook\n00:15 Product Walkthrough\n00:30 Workflow Detail\n00:45 Export Summary"
+    }
+    val parsedPreview = remember(text, totalDurationMs) {
+        SubtitleAndChapterParser.parseChapters(text, totalDurationMs.coerceAtLeast(1L))
+    }
+    val exportedText = remember(clips) {
+        SubtitleAndChapterParser.exportChaptersText(clips)
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("YouTube Chapters / Timestamps") },
+        title = { Text("Chapters & Timestamps") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    text = "Paste timestamps (e.g. 00:00 Intro) to slice clips by chapter, or copy generated chapters below.",
-                    style = MaterialTheme.typography.bodySmall,
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                StudioSegmentedRow(
+                    items = ChaptersModalTab.entries,
+                    selected = activeTab,
+                    label = { it.label },
+                    onSelect = { activeTab = it },
                 )
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = { text = it },
-                    minLines = 6,
-                    maxLines = 10,
-                    placeholder = { Text("00:00 Intro\n00:06 Main Topic\n00:12 Takeaways") },
-                    modifier = Modifier.fillMaxWidth(),
-                )
+
+                if (activeTab == ChaptersModalTab.IMPORT) {
+                    Text(
+                        text = "Paste YouTube-style timestamps (e.g. 00:15 Demo) to split clips by chapter.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = studio.mutedInk,
+                    )
+                    OutlinedTextField(
+                        value = text,
+                        onValueChange = { text = it },
+                        minLines = 5,
+                        maxLines = 8,
+                        placeholder = { Text(sampleChapters) },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        TextButton(onClick = { text = sampleChapters }) {
+                            Text("Insert example")
+                        }
+                        Text(
+                            text = "${parsedPreview.size} ${if (parsedPreview.size == 1) "clip" else "clips"} detected",
+                            style = StudioMonoSmall,
+                            color = studio.mutedInk,
+                        )
+                    }
+                } else {
+                    Text(
+                        text = "Copy timeline cuts as YouTube chapter markers or save slicemark_chapters.json.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = studio.mutedInk,
+                    )
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 180.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        color = studio.surfaceWell,
+                        border = BorderStroke(1.dp, studio.hairline),
+                    ) {
+                        Text(
+                            text = exportedText.ifBlank { "No clips in queue." },
+                            style = StudioMonoSmall,
+                            modifier = Modifier
+                                .verticalScroll(rememberScrollState())
+                                .padding(10.dp),
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = { onExportJson() },
+                            enabled = clips.isNotEmpty(),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.weight(1f).testTag("export_chapters_json_button"),
+                        ) {
+                            Icon(Icons.Filled.Download, null, modifier = Modifier.size(15.dp))
+                            Spacer(Modifier.width(5.dp))
+                            Text("Download JSON")
+                        }
+                        Button(
+                            onClick = {
+                                clipboard.setText(AnnotatedString(exportedText))
+                                copied = true
+                            },
+                            enabled = exportedText.isNotBlank(),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            Icon(
+                                imageVector = if (copied) Icons.Filled.Check else Icons.Filled.ContentCopy,
+                                contentDescription = null,
+                                modifier = Modifier.size(15.dp),
+                            )
+                            Spacer(Modifier.width(5.dp))
+                            Text(if (copied) "Copied" else "Copy")
+                        }
+                    }
+                }
             }
         },
         confirmButton = {
-            Button(
-                onClick = {
-                    onApplyChapters(text)
-                    onDismiss()
-                },
-            ) { Text("Split by Chapters") }
+            if (activeTab == ChaptersModalTab.IMPORT) {
+                Button(
+                    enabled = parsedPreview.isNotEmpty(),
+                    onClick = {
+                        onApplyChapters(text)
+                        onDismiss()
+                    },
+                ) { Text("Create ${if (parsedPreview.isNotEmpty()) parsedPreview.size else ""} Clips".trim()) }
+            } else {
+                Button(onClick = onDismiss) { Text("Done") }
+            }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
+            if (activeTab == ChaptersModalTab.IMPORT) {
+                TextButton(onClick = onDismiss) { Text("Cancel") }
+            }
         },
     )
 }
