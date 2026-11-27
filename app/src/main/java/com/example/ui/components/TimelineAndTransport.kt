@@ -32,6 +32,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Redo
 import androidx.compose.material.icons.automirrored.filled.Undo
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
@@ -41,8 +43,6 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material.icons.filled.VolumeOff
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -164,7 +164,7 @@ fun TransportControlStrip(
                 }
                 IconButton(onClick = onToggleMute, modifier = Modifier.size(36.dp)) {
                     Icon(
-                        imageVector = if (state.audioMotionConfig.muted) Icons.Filled.VolumeOff else Icons.Filled.VolumeUp,
+                        imageVector = if (state.audioMotionConfig.muted) Icons.AutoMirrored.Filled.VolumeOff else Icons.AutoMirrored.Filled.VolumeUp,
                         contentDescription = "Mute audio",
                         tint = if (state.audioMotionConfig.muted) studio.danger else MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier.size(18.dp),
@@ -536,50 +536,61 @@ fun InteractiveTimelinePanel(
                     }
 
                     // Audio Waveform Bar Track + Silence Shading + Scene Markers
-                    Canvas(
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(30.dp)
                             .background(MaterialTheme.colorScheme.background.copy(alpha = 0.7f)),
+                        contentAlignment = Alignment.Center,
                     ) {
-                        // Highlight detected silence gaps subtly
-                        state.detectedSilenceRanges.forEach { range ->
-                            val sx = (range.first.toFloat() / durationMs) * size.width
-                            val ex = (range.last.toFloat() / durationMs) * size.width
-                            drawRect(
-                                color = studio.danger.copy(alpha = 0.22f),
-                                topLeft = Offset(sx, 0f),
-                                size = Size((ex - sx).coerceAtLeast(2f), size.height),
-                            )
-                        }
-
-                        // Waveform peaks
-                        val peaks = state.waveformPeaks
-                        if (peaks.isNotEmpty()) {
-                            val step = size.width / peaks.size
-                            val barW = (step * 0.68f).coerceAtLeast(1.5f)
-                            val activeClip = state.activeClip
-                            peaks.forEachIndexed { idx, amp ->
-                                val barMs = ((idx + 0.5f) / peaks.size) * durationMs
-                                val inActive = activeClip != null && barMs >= activeClip.startMs && barMs <= activeClip.endMs
-                                val h = (amp * size.height * 0.86f).coerceAtLeast(2.dp.toPx())
-                                val x = idx * step
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            // Highlight detected silence gaps subtly
+                            state.detectedSilenceRanges.forEach { range ->
+                                val sx = (range.first.toFloat() / durationMs) * size.width
+                                val ex = (range.last.toFloat() / durationMs) * size.width
                                 drawRect(
-                                    color = if (inActive) studio.timelineAccent else studio.mutedInk.copy(alpha = 0.55f),
-                                    topLeft = Offset(x, size.height - h),
-                                    size = Size(barW, h),
+                                    color = studio.danger.copy(alpha = 0.22f),
+                                    topLeft = Offset(sx, 0f),
+                                    size = Size((ex - sx).coerceAtLeast(2f), size.height),
+                                )
+                            }
+
+                            // Waveform peaks
+                            val peaks = state.waveformPeaks
+                            if (peaks.isNotEmpty()) {
+                                val step = size.width / peaks.size
+                                val barW = (step * 0.68f).coerceAtLeast(1.5f)
+                                val activeClip = state.activeClip
+                                peaks.forEachIndexed { idx, amp ->
+                                    val barMs = ((idx + 0.5f) / peaks.size) * durationMs
+                                    val inActive = activeClip != null && barMs >= activeClip.startMs && barMs <= activeClip.endMs
+                                    val h = (amp * size.height * 0.86f).coerceAtLeast(2.dp.toPx())
+                                    val x = idx * step
+                                    drawRect(
+                                        color = if (inActive) studio.timelineAccent else studio.mutedInk.copy(alpha = 0.55f),
+                                        topLeft = Offset(x, size.height - h),
+                                        size = Size(barW, h),
+                                    )
+                                }
+                            }
+
+                            // Scene change ticks
+                            state.detectedSceneTimestampsMs.forEach { ts ->
+                                val x = (ts.toFloat() / durationMs) * size.width
+                                drawLine(
+                                    color = studio.warning,
+                                    start = Offset(x, 0f),
+                                    end = Offset(x, size.height),
+                                    strokeWidth = 1.5.dp.toPx(),
                                 )
                             }
                         }
 
-                        // Scene change ticks
-                        state.detectedSceneTimestampsMs.forEach { ts ->
-                            val x = (ts.toFloat() / durationMs) * size.width
-                            drawLine(
-                                color = studio.warning,
-                                start = Offset(x, 0f),
-                                end = Offset(x, size.height),
-                                strokeWidth = 1.5.dp.toPx(),
+                        if (state.waveformPeaks.isEmpty()) {
+                            Text(
+                                text = if (state.isAnalyzingMedia) "Analyzing audio waveform…" else "No audio track detected",
+                                style = StudioMonoSmall,
+                                color = studio.mutedInk,
                             )
                         }
                     }

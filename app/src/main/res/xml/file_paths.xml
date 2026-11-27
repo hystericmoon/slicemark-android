@@ -2,6 +2,5 @@
 <paths>
     <cache-path name="exports_cache" path="exports/" />
     <cache-path name="snapshots_cache" path="snapshots/" />
-    <cache-path name="sample_cache" path="samples/" />
     <files-path name="exports_files" path="exports/" />
 </paths>

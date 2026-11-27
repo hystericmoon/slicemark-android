@@ -23,6 +23,7 @@ import kotlin.math.min
 import kotlin.math.sqrt
 
 data class AudioAnalysisResult(
+    val hasAudioTrack: Boolean,
     val waveformPeaks: List<Float>,
     val rmsDb: Float,
     val quietRatio: Float,
@@ -30,25 +31,34 @@ data class AudioAnalysisResult(
 
 object MediaAnalyzer {
 
-    suspend fun inspectSourceMedia(context: Context, uri: Uri, isSample: Boolean = false): SourceMedia =
+    suspend fun inspectSourceMedia(context: Context, uri: Uri): SourceMedia =
         withContext(Dispatchers.IO) {
             val retriever = MediaMetadataRetriever()
             try {
                 setDataSourceSafe(context, retriever, uri)
                 val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                    ?.toLongOrNull()?.coerceAtLeast(500L) ?: 10_000L
+                    ?.toLongOrNull() ?: 0L
                 val width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
-                    ?.toIntOrNull()?.coerceAtLeast(16) ?: 1280
+                    ?.toIntOrNull() ?: 0
                 val height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
-                    ?.toIntOrNull()?.coerceAtLeast(16) ?: 720
+                    ?.toIntOrNull() ?: 0
+
+                if (durationMs <= 0L || width <= 0 || height <= 0) {
+                    throw IllegalArgumentException("Unsupported or unreadable video file.")
+                }
+
                 val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
                     ?.toIntOrNull() ?: 0
                 val bitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)
-                    ?.toLongOrNull()?.coerceAtLeast(300_000L) ?: 4_000_000L
+                    ?.toLongOrNull() ?: 0L
                 val captureRate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
                     ?.toFloatOrNull()?.coerceIn(12f, 120f) ?: 30f
 
                 val (displayName, fileSize) = queryDisplayNameAndSize(context, uri)
+                val effectiveBitrate = if (bitrate > 0L) bitrate
+                else if (fileSize > 0L) ((fileSize * 8L * 1000L) / durationMs).coerceAtLeast(100_000L)
+                else 0L
+
                 SourceMedia(
                     uri = uri,
                     displayName = displayName,
@@ -57,9 +67,8 @@ object MediaAnalyzer {
                     height = height,
                     rotationDegrees = rotation,
                     fileSizeBytes = fileSize,
-                    bitrateBps = bitrate,
+                    bitrateBps = effectiveBitrate,
                     frameRate = captureRate,
-                    isSample = isSample,
                 )
             } finally {
                 runCatching { retriever.release() }
@@ -83,7 +92,7 @@ object MediaAnalyzer {
                 if (bmp != null) frames.add(bmp)
             }
         } catch (_: Throwable) {
-            // Gracefully return any extracted thumbnails
+            // Return genuinely decoded frames only
         } finally {
             runCatching { retriever.release() }
         }
@@ -117,8 +126,9 @@ object MediaAnalyzer {
             }
             if (audioTrackIndex < 0 || audioFormat == null) {
                 return@withContext AudioAnalysisResult(
-                    waveformPeaks = List(barsCount) { 0.08f },
-                    rmsDb = -48f,
+                    hasAudioTrack = false,
+                    waveformPeaks = emptyList(),
+                    rmsDb = -60f,
                     quietRatio = 1f,
                 )
             }
@@ -134,7 +144,6 @@ object MediaAnalyzer {
                 var sawInputEos = false
                 var sawOutputEos = false
                 val durationUs = max(1_000_000L, durationMs * 1000L)
-                // For very long videos, stride samples to stay ultra-fast on mobile
                 val strideUs = if (durationMs > 90_000L) (durationMs / 90L) * 1000L else 0L
                 var lastSampledUs = -strideUs
 
@@ -197,25 +206,36 @@ object MediaAnalyzer {
             }
         } catch (_: Throwable) {
             return@withContext AudioAnalysisResult(
-                waveformPeaks = List(barsCount) { 0.15f },
-                rmsDb = -24f,
-                quietRatio = 0.25f,
+                hasAudioTrack = false,
+                waveformPeaks = emptyList(),
+                rmsDb = -60f,
+                quietRatio = 1f,
             )
         } finally {
             runCatching { extractor.release() }
         }
 
+        if (totalSamples == 0L) {
+            return@withContext AudioAnalysisResult(
+                hasAudioTrack = false,
+                waveformPeaks = emptyList(),
+                rmsDb = -60f,
+                quietRatio = 1f,
+            )
+        }
+
         val rawRms = FloatArray(barsCount) { i ->
             if (bucketCount[i] > 0) sqrt(bucketSumSq[i] / bucketCount[i]).toFloat() else 0f
         }
-        val maxPeak = rawRms.maxOrNull()?.coerceAtLeast(0.01f) ?: 0.01f
-        val normalized = rawRms.map { (it / maxPeak).coerceIn(0.03f, 1f) }
-        val overallRms = if (totalSamples > 0) sqrt(totalSumSq / totalSamples) else 0.001
+        val maxPeak = rawRms.maxOrNull()?.coerceAtLeast(1e-4f) ?: 1e-4f
+        val normalized = rawRms.map { (it / maxPeak).coerceIn(0f, 1f) }
+        val overallRms = sqrt(totalSumSq / totalSamples)
         val rmsDb = (20.0 * log10(overallRms.coerceAtLeast(1e-5))).toFloat().coerceIn(-60f, 0f)
         val quietCount = normalized.count { it < 0.16f }
         val quietRatio = quietCount.toFloat() / barsCount.coerceAtLeast(1)
 
         AudioAnalysisResult(
+            hasAudioTrack = true,
             waveformPeaks = normalized,
             rmsDb = rmsDb,
             quietRatio = quietRatio,
@@ -279,7 +299,7 @@ object MediaAnalyzer {
                 if (prevHist != null) {
                     var l1Diff = 0f
                     for (b in hist.indices) {
-                        l1Diff += abs(hist[b] - prevHist!![b])
+                        l1Diff += abs(hist[b] - prevHist[b])
                     }
                     val combinedScore = (l1Diff * 0.5f) + abs(meanLuma - prevMean) * 0.8f
                     if (combinedScore >= sensitivity && (cuts.isEmpty() || timeMs - cuts.last() >= 1500L)) {
@@ -292,7 +312,7 @@ object MediaAnalyzer {
                 prevMean = meanLuma
             }
         } catch (_: Throwable) {
-            // Return discovered cuts so far
+            // Return verified scene cuts found
         } finally {
             runCatching { retriever.release() }
         }
@@ -301,6 +321,7 @@ object MediaAnalyzer {
 
     /**
      * Samples 6 evenly spaced keyframes and computes real pixel telemetry + audio telemetry locally.
+     * Throws IllegalStateException if no video frames can be decoded rather than fabricating values.
      */
     suspend fun computeKeyframeTelemetry(
         context: Context,
@@ -345,7 +366,6 @@ object MediaAnalyzer {
                 }
                 satSamples.add((satSum / pixels.size.coerceAtLeast(1)).toFloat())
 
-                // Sobel edge gradient & dark-shadow local variance noise estimate
                 var edgeSum = 0.0
                 var edgeCount = 0
                 var darkDiffSum = 0.0
@@ -365,23 +385,16 @@ object MediaAnalyzer {
                     }
                 }
                 edgeSamples.add(((edgeSum / max(1, edgeCount)) * 4.5).toFloat().coerceIn(0f, 1f))
-                noiseSamples.add(
-                    if (darkCount > 20) ((darkDiffSum / darkCount) * 8.0).toFloat().coerceIn(0f, 1f)
-                    else 0.10f
-                )
+                if (darkCount > 0) {
+                    noiseSamples.add(((darkDiffSum / darkCount) * 8.0).toFloat().coerceIn(0f, 1f))
+                }
             }
-        } catch (_: Throwable) {
-            // Fallback to partial telemetry
         } finally {
             runCatching { retriever.release() }
         }
 
-        if (lumaSamples.isEmpty()) {
-            return@withContext TelemetrySnapshot(
-                sampledFrames = 0,
-                audioRmsDb = audioAnalysis.rmsDb,
-                quietRatio = audioAnalysis.quietRatio,
-            )
+        if (sampledCount == 0 || lumaSamples.isEmpty()) {
+            throw IllegalStateException("Unable to decode video keyframes for telemetry analysis.")
         }
 
         lumaSamples.sort()
@@ -398,7 +411,7 @@ object MediaAnalyzer {
             contrastSpread = contrastSpread,
             meanSaturation = satSamples.average().toFloat().coerceIn(0f, 1f),
             edgeSharpness = edgeSamples.average().toFloat().coerceIn(0f, 1f),
-            shadowNoise = noiseSamples.average().toFloat().coerceIn(0f, 1f),
+            shadowNoise = if (noiseSamples.isNotEmpty()) noiseSamples.average().toFloat().coerceIn(0f, 1f) else 0f,
             audioRmsDb = audioAnalysis.rmsDb,
             quietRatio = audioAnalysis.quietRatio,
         )

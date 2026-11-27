@@ -24,7 +24,6 @@ import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.LightMode
-import androidx.compose.material.icons.filled.PlayCircleOutline
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -56,7 +55,6 @@ fun LaunchScreen(
     state: EditorUiState,
     onSelectVideoPhotoPicker: () -> Unit,
     onSelectVideoSaf: () -> Unit,
-    onTrySampleClip: () -> Unit,
     onOpenHistory: () -> Unit,
     onToggleTheme: () -> Unit,
     modifier: Modifier = Modifier,
@@ -187,36 +185,17 @@ fun LaunchScreen(
                             }
                         }
 
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        OutlinedButton(
+                            onClick = onOpenHistory,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .defaultMinSize(minHeight = 48.dp)
+                                .testTag("launch_history_button"),
+                            shape = RoundedCornerShape(10.dp),
                         ) {
-                            OutlinedButton(
-                                onClick = onTrySampleClip,
-                                enabled = !state.isLoadingMedia,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .defaultMinSize(minHeight = 48.dp)
-                                    .testTag("try_sample_button"),
-                                shape = RoundedCornerShape(10.dp),
-                            ) {
-                                Icon(Icons.Filled.PlayCircleOutline, null, modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(6.dp))
-                                Text("Sample Clip", maxLines = 1)
-                            }
-
-                            OutlinedButton(
-                                onClick = onOpenHistory,
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .defaultMinSize(minHeight = 48.dp)
-                                    .testTag("launch_history_button"),
-                                shape = RoundedCornerShape(10.dp),
-                            ) {
-                                Icon(Icons.Filled.History, null, modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(6.dp))
-                                Text("History (${state.history.size})", maxLines = 1)
-                            }
+                            Icon(Icons.Filled.History, null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Local History (${state.history.size})", maxLines = 1)
                         }
 
                         TextButton(

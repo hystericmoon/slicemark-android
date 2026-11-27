@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -28,6 +29,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.model.ClipSegment
@@ -148,6 +152,17 @@ class MainActivity : ComponentActivity() {
                 startActivity(Intent.createChooser(shareIntent, "Share via Slicemark"))
             }
 
+            val lifecycleOwner = LocalLifecycleOwner.current
+            DisposableEffect(lifecycleOwner) {
+                val observer = LifecycleEventObserver { _, event ->
+                    if (event == Lifecycle.Event.ON_STOP) {
+                        vm.pausePlayback()
+                    }
+                }
+                lifecycleOwner.lifecycle.addObserver(observer)
+                onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+            }
+
             LaunchedEffect(state.toastMessage) {
                 val msg = state.toastMessage
                 if (!msg.isNullOrBlank()) {
@@ -167,7 +182,6 @@ class MainActivity : ComponentActivity() {
                                 )
                             },
                             onSelectVideoSaf = { videoSafPicker.launch(arrayOf("video/*")) },
-                            onTrySampleClip = { vm.loadSampleClip() },
                             onOpenHistory = { showHistorySheet = true },
                             onToggleTheme = { vm.toggleDarkTheme() },
                         )

@@ -42,6 +42,14 @@ import kotlin.math.roundToInt
 
 object MediaStoreHelper {
 
+    fun sanitizeDisplayName(raw: String): String {
+        val base = raw.substringAfterLast('/').substringAfterLast('\\')
+            .replace("..", "")
+            .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            .trim('_')
+        return base.ifBlank { "slicemark_export_${System.currentTimeMillis()}" }
+    }
+
     fun saveFileToMediaStore(
         context: Context,
         sourceFile: File,
@@ -49,6 +57,7 @@ object MediaStoreHelper {
         mimeType: String,
         subFolder: String = "Slicemark",
     ): Uri {
+        val safeName = sanitizeDisplayName(displayName)
         val resolver = context.contentResolver
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val (collection, baseDir) = when {
@@ -59,7 +68,7 @@ object MediaStoreHelper {
             }
 
             val values = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                put(MediaStore.MediaColumns.DISPLAY_NAME, safeName)
                 put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
                 put(MediaStore.MediaColumns.RELATIVE_PATH, "$baseDir/$subFolder")
                 put(MediaStore.MediaColumns.IS_PENDING, 1)
@@ -85,7 +94,10 @@ object MediaStoreHelper {
 
         // Fallback for API 24-28 or restricted storage environments
         val exportDir = File(context.cacheDir, "exports").apply { mkdirs() }
-        val destFile = File(exportDir, displayName)
+        val destFile = File(exportDir, safeName)
+        if (!destFile.canonicalPath.startsWith(exportDir.canonicalPath + File.separator)) {
+            throw SecurityException("Invalid export path")
+        }
         if (sourceFile.absolutePath != destFile.absolutePath) {
             sourceFile.copyTo(destFile, overwrite = true)
         }
@@ -241,6 +253,11 @@ object MediaStoreHelper {
         canvas.drawBitmap(transformedSrc, null, dstRect, gradePaint)
         if (transformedSrc != src) transformedSrc.recycle()
 
+        // 4b) Apply real pixel Sharpen / Shadow Denoise pass when active
+        if (visual.denoiseEnabled || visual.sharpen > 0.02f) {
+            applyClarityPassInPlace(output, visual.sharpen, visual.denoiseEnabled)
+        }
+
         // 5) Draw video fade dip if active
         if (alphaFadeMultiplier < 0.995f) {
             val darkAlpha = ((1f - alphaFadeMultiplier.coerceIn(0f, 1f)) * 255f).roundToInt()
@@ -395,6 +412,53 @@ object MediaStoreHelper {
         val left = (dstW - drawW) / 2f
         val top = (dstH - drawH) / 2f
         return RectF(left, top, left + drawW, top + drawH)
+    }
+
+    private fun applyClarityPassInPlace(bitmap: Bitmap, sharpen: Float, denoise: Boolean) {
+        val w = bitmap.width
+        val h = bitmap.height
+        if (w < 4 || h < 4) return
+        val src = IntArray(w * h)
+        val dst = IntArray(w * h)
+        bitmap.getPixels(src, 0, w, 0, 0, w, h)
+        System.arraycopy(src, 0, dst, 0, src.size)
+        val sharpAmt = sharpen.coerceIn(0f, 1f) * 0.65f
+
+        for (y in 1 until h - 1) {
+            val row = y * w
+            for (x in 1 until w - 1) {
+                val idx = row + x
+                val c = src[idx]
+                val l = src[idx - 1]
+                val r = src[idx + 1]
+                val u = src[idx - w]
+                val d = src[idx + w]
+
+                var cr = (c shr 16) and 0xFF
+                var cg = (c shr 8) and 0xFF
+                var cb = c and 0xFF
+
+                val avgR = (((l shr 16) and 0xFF) + ((r shr 16) and 0xFF) + ((u shr 16) and 0xFF) + ((d shr 16) and 0xFF)) shr 2
+                val avgG = (((l shr 8) and 0xFF) + ((r shr 8) and 0xFF) + ((u shr 8) and 0xFF) + ((d shr 8) and 0xFF)) shr 2
+                val avgB = ((l and 0xFF) + (r and 0xFF) + (u and 0xFF) + (d and 0xFF)) shr 2
+
+                if (denoise) {
+                    val diff = kotlin.math.abs(cr - avgR) + kotlin.math.abs(cg - avgG) + kotlin.math.abs(cb - avgB)
+                    if (diff < 42) {
+                        cr = (cr + avgR) shr 1
+                        cg = (cg + avgG) shr 1
+                        cb = (cb + avgB) shr 1
+                    }
+                }
+                if (sharpAmt > 0.01f) {
+                    cr = (cr + ((cr - avgR) * sharpAmt).roundToInt()).coerceIn(0, 255)
+                    cg = (cg + ((cg - avgG) * sharpAmt).roundToInt()).coerceIn(0, 255)
+                    cb = (cb + ((cb - avgB) * sharpAmt).roundToInt()).coerceIn(0, 255)
+                }
+                dst[idx] = (c and 0xFF000000.toInt()) or (cr shl 16) or (cg shl 8) or cb
+            }
+        }
+        bitmap.setPixels(dst, 0, w, 0, 0, w, h)
     }
 
     private fun createFastBlurBackdrop(src: Bitmap, outW: Int, outH: Int): Bitmap {

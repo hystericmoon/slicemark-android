@@ -21,7 +21,6 @@ import com.example.media.ExportCoordinator
 import com.example.media.ExportJobRequest
 import com.example.media.MediaAnalyzer
 import com.example.media.MediaStoreHelper
-import com.example.media.SampleVideoGenerator
 import com.example.model.AspectPreset
 import com.example.model.AudioMotionConfig
 import com.example.model.AutoTuneEngineType
@@ -87,7 +86,12 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     private val undoStack = ArrayDeque<EditorSnapshot>()
     private val redoStack = ArrayDeque<EditorSnapshot>()
-    private var lastAudioAnalysis: AudioAnalysisResult = AudioAnalysisResult(emptyList(), -20f, 0.2f)
+    private var lastAudioAnalysis: AudioAnalysisResult = AudioAnalysisResult(
+        hasAudioTrack = false,
+        waveformPeaks = emptyList(),
+        rmsDb = -60f,
+        quietRatio = 1f,
+    )
     private var cachedTelemetry: TelemetrySnapshot? = null
     private var analysisJob: Job? = null
     private var playheadPollJob: Job? = null
@@ -141,8 +145,16 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     override fun onCleared() {
         analysisJob?.cancel()
         playheadPollJob?.cancel()
+        val framesToRecycle = _uiState.value.filmstripFrames
         player.release()
+        framesToRecycle.forEach { if (!it.isRecycled) it.recycle() }
         super.onCleared()
+    }
+
+    fun pausePlayback() {
+        if (player.isPlaying) {
+            player.pause()
+        }
     }
 
     private fun startPlayheadPolling() {
@@ -200,27 +212,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     // --- Media Loading ---
 
-    fun loadSampleClip() {
-        viewModelScope.launch {
-            _uiState.update { it.copy(isLoadingMedia = true, loadingStatus = "Synthesizing HD studio sample clip…") }
-            val result = runCatching { SampleVideoGenerator.getOrCreateSampleVideo(getApplication()) }
-            result.onSuccess { uri ->
-                loadVideoInternal(uri, isSample = true)
-            }.onFailure { err ->
-                _uiState.update {
-                    it.copy(
-                        isLoadingMedia = false,
-                        loadingStatus = "",
-                        toastMessage = "Failed to generate sample clip: ${err.message}",
-                    )
-                }
-            }
-        }
-    }
-
     fun loadVideoUri(uri: Uri) {
         viewModelScope.launch {
-            loadVideoInternal(uri, isSample = false)
+            loadVideoInternal(uri)
         }
     }
 
@@ -231,11 +225,14 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         undoStack.clear()
         redoStack.clear()
         cachedTelemetry = null
+        val oldFrames = _uiState.value.filmstripFrames
         _uiState.update {
             it.copy(
                 sourceMedia = null,
                 filmstripFrames = emptyList(),
                 waveformPeaks = emptyList(),
+                hasAudioTrack = true,
+                isAnalyzingMedia = false,
                 detectedSilenceRanges = emptyList(),
                 detectedSceneTimestampsMs = emptyList(),
                 clips = emptyList(),
@@ -248,19 +245,23 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 smartCutMessage = null,
             )
         }
+        oldFrames.forEach { if (!it.isRecycled) it.recycle() }
     }
 
-    private suspend fun loadVideoInternal(uri: Uri, isSample: Boolean) {
+    private suspend fun loadVideoInternal(uri: Uri) {
         analysisJob?.cancel()
         undoStack.clear()
         redoStack.clear()
         cachedTelemetry = null
+        val previousFrames = _uiState.value.filmstripFrames
         _uiState.update {
             it.copy(
                 isLoadingMedia = true,
+                isAnalyzingMedia = false,
                 loadingStatus = "Inspecting video stream…",
                 filmstripFrames = emptyList(),
                 waveformPeaks = emptyList(),
+                hasAudioTrack = true,
                 detectedSilenceRanges = emptyList(),
                 detectedSceneTimestampsMs = emptyList(),
                 smartCutMessage = null,
@@ -268,8 +269,9 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
                 canRedo = false,
             )
         }
+        previousFrames.forEach { if (!it.isRecycled) it.recycle() }
 
-        val sourceResult = runCatching { MediaAnalyzer.inspectSourceMedia(getApplication(), uri, isSample) }
+        val sourceResult = runCatching { MediaAnalyzer.inspectSourceMedia(getApplication(), uri) }
         val source = sourceResult.getOrElse { err ->
             _uiState.update {
                 it.copy(
@@ -300,6 +302,7 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             it.copy(
                 sourceMedia = source,
                 isLoadingMedia = false,
+                isAnalyzingMedia = true,
                 loadingStatus = "",
                 trimConfig = defaultTrim,
                 clips = initialClips,
@@ -314,21 +317,25 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
             )
         }
 
-        // Background extraction: filmstrip thumbnails + PCM waveform
+        // Background extraction: filmstrip thumbnails + real PCM waveform
         analysisJob = viewModelScope.launch {
             val frames = MediaAnalyzer.extractFilmstrip(getApplication(), uri, source.durationMs, count = 14)
             _uiState.update { it.copy(filmstripFrames = frames) }
 
             val audio = MediaAnalyzer.extractAudioWaveform(getApplication(), uri, source.durationMs, barsCount = 96)
             lastAudioAnalysis = audio
-            val silences = MediaAnalyzer.detectSilenceRanges(
-                waveformPeaks = audio.waveformPeaks,
-                durationMs = source.durationMs,
-                threshold = _uiState.value.trimConfig.silenceThreshold,
-                minSilenceMs = _uiState.value.trimConfig.minSilenceMs,
-            )
+            val silences = if (audio.hasAudioTrack && audio.waveformPeaks.isNotEmpty()) {
+                MediaAnalyzer.detectSilenceRanges(
+                    waveformPeaks = audio.waveformPeaks,
+                    durationMs = source.durationMs,
+                    threshold = _uiState.value.trimConfig.silenceThreshold,
+                    minSilenceMs = _uiState.value.trimConfig.minSilenceMs,
+                )
+            } else emptyList()
             _uiState.update {
                 it.copy(
+                    hasAudioTrack = audio.hasAudioTrack,
+                    isAnalyzingMedia = false,
                     waveformPeaks = audio.waveformPeaks,
                     detectedSilenceRanges = silences,
                 )
@@ -668,8 +675,12 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
     fun runSilenceJumpCut() {
         val state = _uiState.value
         val source = state.sourceMedia ?: return
-        if (state.waveformPeaks.isEmpty()) {
+        if (state.isAnalyzingMedia && state.waveformPeaks.isEmpty()) {
             showToast("Audio waveform is still analyzing…")
+            return
+        }
+        if (!state.hasAudioTrack || state.waveformPeaks.isEmpty()) {
+            showToast("No audio track detected in this video.")
             return
         }
         pushUndoSnapshot()
@@ -783,74 +794,14 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
         source: SourceMedia,
         trim: TrimConfig,
         silences: List<LongRange>,
-    ): List<ClipSegment> {
-        val dur = source.durationMs.coerceAtLeast(500L)
-        val intervalMs = when (trim.splitMethod) {
-            SplitMethod.INTERVAL -> (trim.intervalSec.coerceIn(3, 600) * 1000L)
-            SplitMethod.N_PARTS -> (dur / trim.targetPartCount.coerceIn(2, 50)).coerceAtLeast(1000L)
-            SplitMethod.MAX_MB -> {
-                val targetBytes = trim.maxFileSizeMb.coerceIn(2, 500) * 1024L * 1024L
-                val bytesPerSec = if (source.fileSizeBytes > 0L) {
-                    (source.fileSizeBytes.toDouble() / (dur / 1000.0)).coerceAtLeast(64_000.0)
-                } else {
-                    (source.bitrateBps / 8.0).coerceAtLeast(128_000.0)
-                }
-                (((targetBytes * 0.90) / bytesPerSec) * 1000.0).toLong().coerceIn(3000L, dur)
-            }
-        }
-
-        val overlapMs = (trim.overlapPreRollSec * 1000f).toLong().coerceAtLeast(0L)
-        val rawSegments = mutableListOf<Pair<Long, Long>>()
-        var cursor = 0L
-
-        while (cursor < dur) {
-            var end = (cursor + intervalMs).coerceAtMost(dur)
-            if (trim.snapToSilence && end < dur && silences.isNotEmpty()) {
-                val nearest = silences.minByOrNull { range ->
-                    val mid = (range.first + range.last) / 2L
-                    abs(mid - end)
-                }
-                if (nearest != null) {
-                    val mid = (nearest.first + nearest.last) / 2L
-                    if (abs(mid - end) <= 3000L && mid > cursor + 1000L) {
-                        end = mid
-                    }
-                }
-            }
-            val startWithPreRoll = if (rawSegments.isEmpty()) cursor else (cursor - overlapMs).coerceAtLeast(0L)
-            rawSegments.add(startWithPreRoll to end)
-            cursor = end
-        }
-
-        // Apply trailing remainder policy
-        if (rawSegments.size > 1) {
-            val last = rawSegments.last()
-            val lastDur = last.second - last.first
-            if (lastDur < 4000L) {
-                when (trim.remainderPolicy) {
-                    RemainderPolicy.KEEP -> Unit
-                    RemainderPolicy.DROP_SHORT -> rawSegments.removeAt(rawSegments.lastIndex)
-                    RemainderPolicy.MERGE_LAST -> {
-                        val prev = rawSegments[rawSegments.lastIndex - 1]
-                        rawSegments[rawSegments.lastIndex - 1] = prev.first to last.second
-                        rawSegments.removeAt(rawSegments.lastIndex)
-                    }
-                }
-            }
-        }
-
-        val prefix = source.displayName.substringBeforeLast('.').take(18).ifBlank { "Clip" }
-        return rawSegments.mapIndexed { idx, (s, e) ->
-            val num = String.format("%02d", idx + 1)
-            val sec = ((e - s) / 1000L).coerceAtLeast(1L)
-            ClipSegment(
-                label = "${prefix}_${num}_${sec}s",
-                startMs = s,
-                endMs = e,
-                isSelected = true,
-            )
-        }
-    }
+    ): List<ClipSegment> = computeBatchClipsPure(
+        durationMs = source.durationMs,
+        fileSizeBytes = source.fileSizeBytes,
+        bitrateBps = source.bitrateBps,
+        displayName = source.displayName,
+        trim = trim,
+        silences = silences,
+    )
 
     private fun relabelClips(list: List<ClipSegment>): List<ClipSegment> {
         val prefix = _uiState.value.sourceMedia?.displayName?.substringBeforeLast('.')?.take(18).orEmpty().ifBlank { "Clip" }
@@ -1280,5 +1231,82 @@ class EditorViewModel(application: Application) : AndroidViewModel(application) 
 
     fun dismissExportOutcome() {
         ExportCoordinator.clearCompletionBanner()
+    }
+
+    companion object {
+        fun computeBatchClipsPure(
+            durationMs: Long,
+            fileSizeBytes: Long,
+            bitrateBps: Long,
+            displayName: String,
+            trim: TrimConfig,
+            silences: List<LongRange>,
+        ): List<ClipSegment> {
+            val dur = durationMs.coerceAtLeast(500L)
+            val intervalMs = when (trim.splitMethod) {
+                SplitMethod.INTERVAL -> (trim.intervalSec.coerceIn(3, 600) * 1000L)
+                SplitMethod.N_PARTS -> (dur / trim.targetPartCount.coerceIn(2, 50)).coerceAtLeast(1000L)
+                SplitMethod.MAX_MB -> {
+                    val targetBytes = trim.maxFileSizeMb.coerceIn(2, 500) * 1024L * 1024L
+                    val bytesPerSec = if (fileSizeBytes > 0L) {
+                        (fileSizeBytes.toDouble() / (dur / 1000.0)).coerceAtLeast(64_000.0)
+                    } else {
+                        (bitrateBps / 8.0).coerceAtLeast(128_000.0)
+                    }
+                    (((targetBytes * 0.90) / bytesPerSec) * 1000.0).toLong().coerceIn(3000L, dur)
+                }
+            }
+
+            val overlapMs = (trim.overlapPreRollSec * 1000f).toLong().coerceAtLeast(0L)
+            val rawSegments = mutableListOf<Pair<Long, Long>>()
+            var cursor = 0L
+
+            while (cursor < dur) {
+                var end = (cursor + intervalMs).coerceAtMost(dur)
+                if (trim.snapToSilence && end < dur && silences.isNotEmpty()) {
+                    val nearest = silences.minByOrNull { range ->
+                        val mid = (range.first + range.last) / 2L
+                        abs(mid - end)
+                    }
+                    if (nearest != null) {
+                        val mid = (nearest.first + nearest.last) / 2L
+                        if (abs(mid - end) <= 3000L && mid > cursor + 1000L) {
+                            end = mid
+                        }
+                    }
+                }
+                val startWithPreRoll = if (rawSegments.isEmpty()) cursor else (cursor - overlapMs).coerceAtLeast(0L)
+                rawSegments.add(startWithPreRoll to end)
+                cursor = end
+            }
+
+            if (rawSegments.size > 1) {
+                val last = rawSegments.last()
+                val lastDur = last.second - last.first
+                if (lastDur < 4000L) {
+                    when (trim.remainderPolicy) {
+                        RemainderPolicy.KEEP -> Unit
+                        RemainderPolicy.DROP_SHORT -> rawSegments.removeAt(rawSegments.lastIndex)
+                        RemainderPolicy.MERGE_LAST -> {
+                            val prev = rawSegments[rawSegments.lastIndex - 1]
+                            rawSegments[rawSegments.lastIndex - 1] = prev.first to last.second
+                            rawSegments.removeAt(rawSegments.lastIndex)
+                        }
+                    }
+                }
+            }
+
+            val prefix = displayName.substringBeforeLast('.').take(18).ifBlank { "Clip" }
+            return rawSegments.mapIndexed { idx, (s, e) ->
+                val num = String.format("%02d", idx + 1)
+                val sec = ((e - s) / 1000L).coerceAtLeast(1L)
+                ClipSegment(
+                    label = "${prefix}_${num}_${sec}s",
+                    startMs = s,
+                    endMs = e,
+                    isSelected = true,
+                )
+            }
+        }
     }
 }

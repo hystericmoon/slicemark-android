@@ -81,7 +81,7 @@ enum class ExportFormat(val label: String, val extension: String, val mimeType: 
     MP4("MP4", "mp4", "video/mp4"),
     WEBM("WebM", "webm", "video/webm"),
     GIF("GIF", "gif", "image/gif"),
-    MP3("MP3", "mp3", "audio/mpeg", isAudioOnly = true),
+    MP3("AAC / M4A", "m4a", "audio/mp4", isAudioOnly = true),
     WAV("WAV", "wav", "audio/wav", isAudioOnly = true),
 }
 
@@ -107,9 +107,8 @@ data class SourceMedia(
     val height: Int,
     val rotationDegrees: Int = 0,
     val fileSizeBytes: Long = 0L,
-    val bitrateBps: Long = 4_000_000L,
+    val bitrateBps: Long = 0L,
     val frameRate: Float = 30f,
-    val isSample: Boolean = false,
 ) {
     val effectiveWidth: Int get() = if (rotationDegrees % 180 == 90) height else width
     val effectiveHeight: Int get() = if (rotationDegrees % 180 == 90) width else height
@@ -366,6 +365,8 @@ data class EditorUiState(
     val loadingStatus: String = "",
     val filmstripFrames: List<Bitmap> = emptyList(),
     val waveformPeaks: List<Float> = emptyList(),
+    val hasAudioTrack: Boolean = true,
+    val isAnalyzingMedia: Boolean = false,
     val detectedSilenceRanges: List<LongRange> = emptyList(),
     val detectedSceneTimestampsMs: List<Long> = emptyList(),
     val clips: List<ClipSegment> = emptyList(),

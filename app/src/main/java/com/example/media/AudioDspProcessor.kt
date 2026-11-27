@@ -2,8 +2,10 @@ package com.example.media
 
 import android.content.Context
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMuxer
 import android.net.Uri
 import androidx.annotation.OptIn
 import androidx.media3.common.C
@@ -145,6 +147,69 @@ class StudioAudioProcessor(
  */
 object AudioTrackExporter {
 
+    data class RenderedAudio(
+        val samples: ShortArray,
+        val sampleRate: Int,
+        val channels: Int,
+    )
+
+    suspend fun renderProcessedPcm(
+        context: Context,
+        videoUri: Uri,
+        clips: List<com.example.model.ClipSegment>,
+        config: AudioMotionConfig,
+    ): RenderedAudio? = withContext(Dispatchers.IO) {
+        if (config.muted && config.bgTrackUri == null) return@withContext null
+        val speed = config.playbackSpeed.coerceIn(0.5f, 2.0f)
+
+        var sampleRate = 44100
+        var channels = 2
+        val combinedList = mutableListOf<ShortArray>()
+        var anyAudio = false
+
+        for (clip in clips) {
+            val decoded = decodePcmSegment(context, videoUri, clip.startMs, clip.endMs)
+            if (decoded != null && decoded.samples.isNotEmpty()) {
+                sampleRate = decoded.sampleRate
+                channels = decoded.channels
+                anyAudio = true
+                var chunk = resampleSpeed(decoded.samples, channels, speed)
+                if (config.boomerangEnabled) {
+                    chunk = chunk + reversePcmFrames(chunk, channels)
+                } else if (config.reverseEnabled) {
+                    chunk = reversePcmFrames(chunk, channels)
+                }
+                combinedList.add(chunk)
+            } else {
+                val outDurSec = ((clip.durationMs / speed) / 1000.0).coerceAtLeast(0.1)
+                val mul = if (config.boomerangEnabled) 2 else 1
+                val silenceFrames = (outDurSec * sampleRate).toInt().coerceAtLeast(1) * mul
+                combinedList.add(ShortArray(silenceFrames * channels))
+            }
+        }
+
+        if (!anyAudio && config.bgTrackUri == null) return@withContext null
+
+        val totalLen = combinedList.sumOf { it.size }
+        val merged = ShortArray(totalLen)
+        var offset = 0
+        for (arr in combinedList) {
+            System.arraycopy(arr, 0, merged, offset, arr.size)
+            offset += arr.size
+        }
+
+        val bgPcm = config.bgTrackUri?.let { decodePcmSegment(context, it, 0L, 180_000L) }
+        val processed = applyOfflineDspAndMix(
+            main = merged,
+            channels = channels,
+            sampleRate = sampleRate,
+            config = config,
+            bgSamples = bgPcm?.samples,
+            bgChannels = bgPcm?.channels ?: channels,
+        )
+        RenderedAudio(processed, sampleRate, channels)
+    }
+
     suspend fun exportClipAudioToWav(
         context: Context,
         videoUri: Uri,
@@ -152,39 +217,144 @@ object AudioTrackExporter {
         endMs: Long,
         config: AudioMotionConfig,
         outputWavFile: File,
+    ): Boolean = exportClipsAudioToWav(
+        context = context,
+        videoUri = videoUri,
+        clips = listOf(com.example.model.ClipSegment(startMs = startMs, endMs = endMs)),
+        config = config,
+        outputWavFile = outputWavFile,
+    )
+
+    suspend fun exportClipsAudioToWav(
+        context: Context,
+        videoUri: Uri,
+        clips: List<com.example.model.ClipSegment>,
+        config: AudioMotionConfig,
+        outputWavFile: File,
     ): Boolean = withContext(Dispatchers.IO) {
-        val mainPcm = decodePcmSegment(context, videoUri, startMs, endMs)
-        val sampleRate = mainPcm?.sampleRate ?: 44100
-        val channels = mainPcm?.channels ?: 2
-        val durationSec = ((endMs - startMs).coerceAtLeast(250L) / 1000.0)
-        val totalFrames = (durationSec * sampleRate).toInt().coerceAtLeast(1)
-
-        var samples = mainPcm?.samples ?: ShortArray(totalFrames * channels)
-        if (samples.isEmpty()) {
-            samples = ShortArray(totalFrames * channels)
-        }
-
-        // Apply Reverse or Boomerang on PCM frame groups
-        if (config.boomerangEnabled) {
-            val reversed = reversePcmFrames(samples, channels)
-            samples = samples + reversed
-        } else if (config.reverseEnabled) {
-            samples = reversePcmFrames(samples, channels)
-        }
-
-        // Optional looping background track mix
-        val bgPcm = config.bgTrackUri?.let { decodePcmSegment(context, it, 0L, 120_000L) }
-        val processed = applyOfflineDspAndMix(
-            main = samples,
-            channels = channels,
-            sampleRate = sampleRate,
-            config = config,
-            bgSamples = bgPcm?.samples,
-            bgChannels = bgPcm?.channels ?: channels,
-        )
-
-        writeWavFile(outputWavFile, processed, sampleRate, channels)
+        val totalMs = clips.sumOf { it.durationMs }.coerceAtLeast(250L)
+        val rendered = renderProcessedPcm(context, videoUri, clips, config)
+            ?: run {
+                val frames = ((totalMs / 1000.0) * 44100).toInt().coerceAtLeast(1)
+                RenderedAudio(ShortArray(frames * 2), 44100, 2)
+            }
+        writeWavFile(outputWavFile, rendered.samples, rendered.sampleRate, rendered.channels)
         true
+    }
+
+    suspend fun exportClipsAudioToM4a(
+        context: Context,
+        videoUri: Uri,
+        clips: List<com.example.model.ClipSegment>,
+        config: AudioMotionConfig,
+        outputM4aFile: File,
+    ): Boolean = withContext(Dispatchers.IO) {
+        val totalMs = clips.sumOf { it.durationMs }.coerceAtLeast(250L)
+        val rendered = renderProcessedPcm(context, videoUri, clips, config)
+            ?: run {
+                val frames = ((totalMs / 1000.0) * 44100).toInt().coerceAtLeast(1)
+                RenderedAudio(ShortArray(frames * 2), 44100, 2)
+            }
+        val format = MediaFormat.createAudioFormat(
+            MediaFormat.MIMETYPE_AUDIO_AAC,
+            rendered.sampleRate,
+            rendered.channels,
+        ).apply {
+            setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+            setInteger(MediaFormat.KEY_BIT_RATE, 192_000)
+            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16_384)
+        }
+        val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+        val muxer = MediaMuxer(outputM4aFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        var trackIndex = -1
+        var muxerStarted = false
+        try {
+            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            encoder.start()
+
+            val pcmBytes = ByteArray(rendered.samples.size * 2)
+            ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().put(rendered.samples)
+
+            val info = MediaCodec.BufferInfo()
+            var offset = 0
+            var framesSent = 0L
+            var inputDone = false
+            var outputDone = false
+            val bytesPerFrame = rendered.channels * 2
+
+            while (!outputDone) {
+                if (!inputDone) {
+                    val inIdx = encoder.dequeueInputBuffer(10_000)
+                    if (inIdx >= 0) {
+                        val inBuf = encoder.getInputBuffer(inIdx)!!
+                        inBuf.clear()
+                        val remaining = pcmBytes.size - offset
+                        if (remaining <= 0) {
+                            encoder.queueInputBuffer(
+                                inIdx,
+                                0,
+                                0,
+                                (framesSent * 1_000_000L) / rendered.sampleRate,
+                                MediaCodec.BUFFER_FLAG_END_OF_STREAM,
+                            )
+                            inputDone = true
+                        } else {
+                            val chunk = min(inBuf.capacity(), remaining)
+                            val aligned = chunk - (chunk % bytesPerFrame)
+                            inBuf.put(pcmBytes, offset, aligned)
+                            val ptsUs = (framesSent * 1_000_000L) / rendered.sampleRate
+                            encoder.queueInputBuffer(inIdx, 0, aligned, ptsUs, 0)
+                            offset += aligned
+                            framesSent += aligned / bytesPerFrame
+                        }
+                    }
+                }
+
+                val outIdx = encoder.dequeueOutputBuffer(info, 10_000)
+                when {
+                    outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        if (!muxerStarted) {
+                            trackIndex = muxer.addTrack(encoder.outputFormat)
+                            muxer.start()
+                            muxerStarted = true
+                        }
+                    }
+                    outIdx >= 0 -> {
+                        val outBuf = encoder.getOutputBuffer(outIdx)
+                        if (outBuf != null && info.size > 0 && (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 && muxerStarted) {
+                            outBuf.position(info.offset)
+                            outBuf.limit(info.offset + info.size)
+                            muxer.writeSampleData(trackIndex, outBuf, info)
+                        }
+                        encoder.releaseOutputBuffer(outIdx, false)
+                        if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true
+                    }
+                }
+            }
+            true
+        } finally {
+            runCatching { encoder.stop(); encoder.release() }
+            runCatching { if (muxerStarted) muxer.stop(); muxer.release() }
+        }
+    }
+
+    private fun resampleSpeed(src: ShortArray, channels: Int, speed: Float): ShortArray {
+        if (abs(speed - 1f) < 0.01f || src.isEmpty()) return src
+        val inFrames = src.size / channels
+        val outFrames = (inFrames / speed).roundToInt().coerceAtLeast(1)
+        val out = ShortArray(outFrames * channels)
+        for (f in 0 until outFrames) {
+            val srcPos = f * speed
+            val f0 = srcPos.toInt().coerceIn(0, inFrames - 1)
+            val f1 = (f0 + 1).coerceIn(0, inFrames - 1)
+            val frac = srcPos - f0
+            for (c in 0 until channels) {
+                val s0 = src[f0 * channels + c]
+                val s1 = src[f1 * channels + c]
+                out[f * channels + c] = (s0 + (s1 - s0) * frac).roundToInt().coerceIn(-32767, 32767).toShort()
+            }
+        }
+        return out
     }
 
     private data class DecodedPcm(

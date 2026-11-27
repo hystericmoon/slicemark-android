@@ -319,8 +319,8 @@ object SmartAutoTuneEngine {
         var lastTransientError = "Gemini models busy"
 
         for (modelId in chain) {
-            val cleanModel = modelId.removePrefix("models/")
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent?key=$apiKey"
+            val cleanModel = sanitizeModelId(modelId.removePrefix("models/")) ?: continue
+            val url = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent"
             val payload = JSONObject().apply {
                 put(
                     "contents",
@@ -346,6 +346,7 @@ object SmartAutoTuneEngine {
 
             val req = Request.Builder()
                 .url(url)
+                .addHeader("x-goog-api-key", apiKey)
                 .post(payload.toString().toRequestBody(jsonMediaType))
                 .build()
 
@@ -445,17 +446,18 @@ object SmartAutoTuneEngine {
         }.getOrNull()
     }
 
+    fun sanitizeModelId(raw: String): String? {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty() || trimmed.length > 96) return null
+        if (trimmed.contains("..") || !Regex("^[a-zA-Z0-9._:/-]+$").matches(trimmed)) return null
+        return trimmed
+    }
+
     private fun buildSuggestedHighlights(durationMs: Long, waveformPeaks: List<Float>): List<SuggestedHighlight> {
-        if (durationMs < 4000L) {
-            return listOf(SuggestedHighlight("Peak Moment", 0L, durationMs))
+        if (durationMs < 4000L || waveformPeaks.size < 8) {
+            return emptyList()
         }
         val windowMs = minOf(6000L, durationMs / 3L).coerceAtLeast(2500L)
-        if (waveformPeaks.size < 8) {
-            return listOf(
-                SuggestedHighlight("Opening Hook", 0L, windowMs),
-                SuggestedHighlight("Mid Highlight", (durationMs / 2L - windowMs / 2L).coerceAtLeast(0L), (durationMs / 2L + windowMs / 2L).coerceAtMost(durationMs)),
-            )
-        }
 
         val barMs = durationMs.toDouble() / waveformPeaks.size
         val windowBars = (windowMs / barMs).roundToInt().coerceIn(2, waveformPeaks.size / 2)

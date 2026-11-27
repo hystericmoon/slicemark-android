@@ -29,6 +29,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AspectRatio
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Close
@@ -107,6 +108,7 @@ fun EditorWorkspaceScreen(
         // Top Studio Header Bar
         StudioTopBar(
             state = state,
+            onReturnHome = { viewModel.closeProjectToHome() },
             onReplaceVideo = onReplaceVideo,
             onOpenHistory = onOpenHistory,
             onToggleTheme = { viewModel.toggleDarkTheme() },
@@ -156,6 +158,7 @@ fun EditorWorkspaceScreen(
 @Composable
 private fun StudioTopBar(
     state: EditorUiState,
+    onReturnHome: () -> Unit,
     onReplaceVideo: () -> Unit,
     onOpenHistory: () -> Unit,
     onToggleTheme: () -> Unit,
@@ -171,14 +174,24 @@ private fun StudioTopBar(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .padding(horizontal = 8.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
+                IconButton(
+                    onClick = onReturnHome,
+                    modifier = Modifier.testTag("topbar_back_home_button"),
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "Back to Home",
+                        tint = MaterialTheme.colorScheme.onSurface,
+                    )
+                }
                 SlicemarkBrandMark(sizeDp = 24)
                 Column {
                     Text("Slicemark", style = MaterialTheme.typography.titleMedium)

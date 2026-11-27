@@ -221,6 +221,9 @@ fun VideoPreviewViewport(
                             }
                         }
                     },
+                    onRelease = { pv ->
+                        pv.player = null
+                    },
                     modifier = Modifier.fillMaxSize(),
                 )
 
